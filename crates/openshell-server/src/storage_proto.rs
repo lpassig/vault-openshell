@@ -181,7 +181,7 @@ mod tests {
     // public-only messages alongside main's SPIFFE metadata; durable schemas
     // and the public/durable overlap remain unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "96a8759b79770164698f9203493fe99ce8d50c02b1bc22204a90c5241782a59d";
+        "6187a378d2bb9bdce821b9512d5b40a5ca99fa3e42bb8eb49d2c104578ea9d62";
     const DURABLE_SCHEMA_SHA256: &str =
         "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
