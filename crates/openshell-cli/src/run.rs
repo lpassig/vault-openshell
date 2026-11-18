@@ -1130,6 +1130,8 @@ pub async fn sandbox_create(
                 );
                 if let Some(url) = service_urls.get("").filter(|url| !url.is_empty()) {
                     eprintln!("  Access at: {url}");
+                } else {
+                    eprintln!("  {NO_PUBLIC_SERVICE_URL}");
                 }
             }
 
@@ -4379,7 +4381,9 @@ pub async fn service_expose(
             target_port,
         );
     }
-    if !response.url.is_empty() {
+    if response.url.is_empty() {
+        println!("  {NO_PUBLIC_SERVICE_URL}");
+    } else {
         let url = preferred_service_url(&response, server);
         println!("  URL: {}", url.cyan());
     }
@@ -4698,6 +4702,8 @@ fn service_endpoint_to_json(
         "gateway_url": service_url_for_gateway(&response.gateway_url, gateway_endpoint),
     }))
 }
+
+const NO_PUBLIC_SERVICE_URL: &str = "No public URL is configured for this service. Ask the gateway operator to configure application ingress or gateway service routing.";
 
 fn service_display_name(service: &str) -> &str {
     if service.is_empty() { "-" } else { service }
