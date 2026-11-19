@@ -30,3 +30,16 @@ decision := {"allow": true, "reason": "provider_admitted", "ttl_secs": 30, "scop
     input.spiffe_id == input.intent.expected_spiffe_id
     input.expires_at > input.now
 }
+
+decision := {"allow": true, "reason": "configuration_admitted", "ttl_secs": 30, "scopes": ["configuration_activation"]} if {
+    input.stage == "activation"
+    input.intent.driver == "docker"
+    input.parent_decision_id != ""
+    input.proof_verified
+    count(input.selectors) > 0
+    input.host_id != null
+    input.runtime_identity != ""
+    input.spiffe_id != null
+    input.resource != ""
+    input.expires_at > input.now
+}

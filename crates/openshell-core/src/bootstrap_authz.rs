@@ -21,12 +21,14 @@ use uuid::Uuid;
 pub const POLICY: &str = include_str!("bootstrap_authz/policy.rego");
 pub const BOOTSTRAP_CAPABILITY: &str = "bootstrap";
 pub const PROVIDER_CAPABILITY: &str = "provider_access";
+pub const ACTIVATION_CAPABILITY: &str = "configuration_activation";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
     Bootstrap,
     Provider,
+    Activation,
 }
 
 /// Fixed, secret-free errors. Adapter and policy diagnostics must not escape.
@@ -579,6 +581,104 @@ impl BootstrapGate {
         result
     }
 
+    /// Authorize one configuration acknowledgement on an authenticated SPIFFE
+    /// connection. This capability confers no provider credential access.
+    pub async fn activate_docker(
+        &self,
+        grant: &Grant,
+        intent: &SandboxIntent,
+        observation: &crate::proto::compute::v1::SupervisorRuntimeObservation,
+        peer: Option<&openshell_crypto::tls::spiffe::VerifiedSpiffeClient>,
+        configuration_fence: &str,
+        now: i64,
+    ) -> Result<Grant, Denial> {
+        let id = fresh_id()?;
+        let result = tokio::time::timeout(self.timeout, async {
+            if grant.intent != *intent || grant.expires_at <= now || grant.issued_at > now {
+                return Err(Denial::StaleEvidence);
+            }
+            if !grant.scopes.contains(BOOTSTRAP_CAPABILITY) || configuration_fence.is_empty() {
+                return Err(Denial::MissingSignal);
+            }
+            let spiffe_id = docker_supervisor_spiffe_id(intent, observation)?;
+            let unix_time = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(
+                u64::try_from(now).map_err(|_| Denial::StaleEvidence)?,
+            ));
+            let certificate_expiry = peer
+                .ok_or(Denial::MissingSignal)?
+                .authorize(&spiffe_id, unix_time)
+                .map_err(|_| Denial::InvalidProof)?;
+            self.sandbox_authorization.verify(intent, now).await?;
+            let context = AttestationContext {
+                stage: Stage::Activation,
+                challenge: id.clone(),
+                now,
+                intent: intent.clone(),
+                runtime_identity: Some(observation.runtime_identity.clone()),
+                expected_device_id: Some(grant.device_id.clone()),
+                request_evidence: None,
+            };
+            let device = self.device.attest(&context).await?;
+            validate_device(&device, &context)?;
+            if device.device_revision != grant.device_revision
+                || device.runtime_identity.as_ref() != context.runtime_identity.as_ref()
+                || device.host_id.as_deref().is_none_or(str::is_empty)
+                || device.selectors.is_empty()
+            {
+                return Err(Denial::IdentityMismatch);
+            }
+            let request = DecisionRequest {
+                request_id: id.clone(),
+                parent_decision_id: Some(grant.decision_id.clone()),
+                stage: Stage::Activation,
+                intent: intent.clone(),
+                device_id: device.device_id.clone(),
+                device_revision: device.device_revision.clone(),
+                host_id: device.host_id.clone(),
+                runtime_identity: context.runtime_identity.clone(),
+                spiffe_id: Some(spiffe_id),
+                proof_verified: true,
+                selectors: device.selectors.clone(),
+                resource: configuration_fence.into(),
+                now,
+                expires_at: grant
+                    .expires_at
+                    .min(device.expires_at)
+                    .min(certificate_expiry),
+            };
+            let response = self.authorizer.decide(&request).await?;
+            let expires_at = validate_response(&request, &response, ACTIVATION_CAPABILITY)?;
+            Ok(Grant {
+                decision_id: id.clone(),
+                intent: intent.clone(),
+                device_id: device.device_id,
+                device_revision: device.device_revision,
+                host_id: device.host_id,
+                runtime_identity: context.runtime_identity,
+                proof_key_digest: None,
+                selectors: device.selectors,
+                challenge: String::new(),
+                issued_at: now,
+                expires_at,
+                scopes: response.scopes,
+            })
+        })
+        .await
+        .unwrap_or(Err(Denial::Timeout));
+        self.audit(
+            &id,
+            Some(&grant.decision_id),
+            Stage::Activation,
+            intent,
+            result.as_ref().ok(),
+            &result.as_ref().map(|_| ()),
+            now,
+            configuration_fence,
+        )
+        .await?;
+        result
+    }
+
     /// Re-attest after asynchronous work, before minting and before delivery.
     pub async fn recheck(
         &self,
@@ -670,6 +770,37 @@ fn digest(bytes: &[u8]) -> Result<String, Denial> {
     use base64::Engine as _;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(openshell_crypto::sha256(bytes).map_err(|_| Denial::Unavailable)?))
+}
+
+/// Expected X.509 identity for the sandbox's current Docker supervisor. The
+/// observation must be read from the configured, trusted compute driver.
+pub fn docker_supervisor_spiffe_id(
+    intent: &SandboxIntent,
+    observation: &crate::proto::compute::v1::SupervisorRuntimeObservation,
+) -> Result<String, Denial> {
+    if intent.driver != "docker"
+        || observation.sandbox_id != intent.sandbox_id
+        || observation.generation != intent.generation
+        || observation.auth_epoch != intent.auth_epoch
+    {
+        return Err(Denial::IdentityMismatch);
+    }
+    let container_id = observation
+        .runtime_identity
+        .strip_prefix("docker://")
+        .filter(|id| {
+            id.len() == 64
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+        .ok_or(Denial::IdentityMismatch)?;
+    let id = format!(
+        "{}/generation/{}/epoch/{}/supervisor/{container_id}",
+        intent.expected_spiffe_id, intent.generation, intent.auth_epoch
+    );
+    openshell_spiffe::SandboxSpiffeIdPrefix::parse(&id).map_err(|_| Denial::IdentityMismatch)?;
+    Ok(id)
 }
 
 fn fresh_id() -> Result<String, Denial> {

@@ -98,6 +98,7 @@ impl BootstrapAuthorizer for MockAuthorizer {
             scopes: BTreeSet::from([match request.stage {
                 Stage::Bootstrap => BOOTSTRAP_CAPABILITY,
                 Stage::Provider => PROVIDER_CAPABILITY,
+                Stage::Activation => ACTIVATION_CAPABILITY,
             }
             .into()]),
         })
@@ -451,6 +452,33 @@ async fn local_rego_policy_allows_and_denies() {
     let denied = gate.authorizer.decide(&invalid_request).await.unwrap();
     assert!(!denied.allow);
     assert_eq!(denied.reason, "policy_denied");
+    let mut docker = intent();
+    docker.driver = "docker".into();
+    let observation = crate::proto::compute::v1::SupervisorRuntimeObservation {
+        sandbox_id: docker.sandbox_id.clone(),
+        runtime_identity: format!("docker://{}", "a".repeat(64)),
+        generation: docker.generation.clone(),
+        auth_epoch: docker.auth_epoch,
+    };
+    let mut activation = DecisionRequest {
+        stage: Stage::Activation,
+        spiffe_id: Some(docker_supervisor_spiffe_id(&docker, &observation).unwrap()),
+        intent: docker,
+        host_id: Some("host-a".into()),
+        runtime_identity: Some(observation.runtime_identity),
+        proof_verified: true,
+        selectors: BTreeSet::from(["verified:fixture".into()]),
+        parent_decision_id: Some(grant.decision_id),
+        resource: "configuration-fence".into(),
+        ..invalid_request
+    };
+    let allowed = gate.authorizer.decide(&activation).await.unwrap();
+    assert_eq!(
+        validate_response(&activation, &allowed, ACTIVATION_CAPABILITY),
+        Ok(NOW + 30)
+    );
+    activation.proof_verified = false;
+    assert!(!gate.authorizer.decide(&activation).await.unwrap().allow);
     assert!(
         gate.bootstrap(invalid, "test-device-session", NOW)
             .await
