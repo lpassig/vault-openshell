@@ -199,6 +199,14 @@ verification enabled and issue a certificate for the service DNS name.
 
 For configured gateway interceptors, inspect `[[openshell.gateway.interceptors]]`, their Unix or network endpoints, and gateway startup logs:
 
+If experimental `[openshell.gateway.bootstrap_authorization] enabled = true`,
+inspect `openshell::bootstrap_authz` decisions before debugging provider token
+or Vault access. The shipped device and owner/mission adapters deny admission;
+the flag is for verifier integration and defaults off. The first slice requires
+Kubernetes gateway supervision and rejects renewal, secret-bearing snapshots
+and legacy exchanges. Do not disable verification or use a mock adapter to
+restore production access. Confirm the operator intended to enable this mode.
+
 ```bash
 rg -n 'interceptors|provider_profile_sources|grpc_endpoint|tls_ca_cert_path|audience|allow_insecure_transport|binding_policy|failure_policy|gateway_jwt' /etc/openshell/gateway.toml
 stat /run/openshell/interceptors/<name>.sock

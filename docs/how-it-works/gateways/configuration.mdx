@@ -1658,6 +1658,49 @@ Provider-token requests use a separate instance of the configured gRPC rate
 budget. Authenticated work is also capped at four concurrent requests per
 sandbox and 64 per gateway, including when token caching is disabled.
 
+### Experimental bootstrap authorization
+
+Bootstrap authorization is disabled by default. The experimental gateway path
+admits a sandbox before minting its launch JWTs, then requires a fresh signed
+workload proof before each gateway-owned provider-token request. Both JWT
+profiles expire within the admission decision's maximum 60-second lifetime.
+
+```toml
+[openshell.gateway.bootstrap_authorization]
+enabled = false
+opa_executable = "/usr/local/bin/opa"
+timeout_ms = 2000
+```
+
+Enabling this path requires gateway TLS, gateway JWT signing with a positive TTL, the SPIFFE
+broker, Kubernetes `supervisor_topology = "gateway"`, and no supervisor
+`provider_spiffe_workload_api_socket_path`. The OPA executable must be an
+absolute file path. Device/host attestation and owner/mission authorization
+adapters are integration interfaces; the built-in adapters deny every admission.
+The gateway does not ship a production enrollment service or a supervisor key
+signer. Enabling the flag with the shipped adapters therefore prevents new
+sandbox launch credentials from being issued.
+
+Admission requires exactly one `x-openshell-device-evidence` header. Its opaque
+evidence or session reference must let the attestation adapter verify the
+claimant against the authenticated owner, sandbox intent and fresh gateway
+challenge. Looking up an owner's enrolled device is insufficient. All replicas
+sharing the gateway signing identity must enforce the same flag and policy.
+
+An integrated caller supplies `x-openshell-workload-proof` to
+`GetSandboxProviderAccessToken`. The gateway verifies an Ed25519 proof against
+an independently attested workload key and binds it to the sandbox, generation,
+credential epoch, gateway bearer ID, admission decision, device, audience and
+configured credential. Proofs expire within 30 seconds and are single-use
+across gateway replicas. A JWT-SVID match alone cannot satisfy key possession.
+
+The initial slice rejects session renewal, extension credential issuance,
+credential-bearing configuration snapshots, and legacy intermediate-exchange
+requests while enabled. It bypasses provider-token caches. Real adapters must
+verify fresh requester and host posture, runtime/key binding and trusted SPIRE
+selector facts; they must also revalidate sandbox authorization. This is an
+integration slice, not a production-ready deployment mode.
+
 ### MXC
 
 The MXC driver runs native Windows workloads through `wxc-exec`. Use this

@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Bootstrap authorization
+
+on:
+  push:
+    branches: ["codex/**"]
+    paths:
+      - "crates/openshell-core/**"
+      - "crates/openshell-server/**"
+      - ".github/workflows/bootstrap-authz.yml"
+      - "Cargo.lock"
+  pull_request:
+    paths:
+      - "crates/openshell-core/**"
+      - "crates/openshell-server/**"
+      - ".github/workflows/bootstrap-authz.yml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bootstrap-authz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            https://github.com/open-policy-agent/opa/releases/download/v1.22.4/opa_linux_amd64_static \
+            --output "$RUNNER_TEMP/opa"
+          echo "35e3b352e715e80624ead6c89930d8585f6f7d94cdc409eb2a9fe36620dcccba  $RUNNER_TEMP/opa" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/opa"
+          echo "OPENSHELL_TEST_OPA=$RUNNER_TEMP/opa" >> "$GITHUB_ENV"
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Core authorization and JWT regressions
+        run: cargo test --locked -p openshell-core --no-default-features --features bootstrap-authz --lib -- --include-ignored
+      - name: Gateway and Vault security integration
+        run: cargo test --locked -p openshell-server --features prebuilt-z3,test-support --lib bootstrap
+      - name: Existing authentication regressions
+        run: |
+          cargo test --locked -p openshell-server --features prebuilt-z3,test-support --lib auth::sandbox_session::tests
+          cargo test --locked -p openshell-server --features prebuilt-z3,test-support --lib auth::sandbox_jwt::tests
+          cargo test --locked -p openshell-server --features prebuilt-z3,test-support --lib grpc::auth_rpc::tests

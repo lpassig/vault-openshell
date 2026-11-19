@@ -4,6 +4,14 @@ This document describes how OpenShell's continuous integration works for pull re
 
 For local test commands see [TESTING.md](TESTING.md). For PR conventions see [CONTRIBUTING.md](CONTRIBUTING.md).
 
+The experimental bootstrap authorization slice also has an isolated
+[`Bootstrap authorization`](.github/workflows/bootstrap-authz.yml) workflow on
+GitHub-hosted Ubuntu. It runs on relevant PR changes and `codex/**` pushes,
+pins the local OPA evaluator by version and checksum, and runs core/JWT tests
+plus gateway tests against mock SPIRE, Vault and OAuth services. This workflow
+qualifies the integration slice; production attestation providers and a real
+SPIRE deployment still require separate validation.
+
 ## Overview
 
 PR CI that runs on NVIDIA self-hosted runners uses NVIDIA's copy-pr-bot. The bot mirrors trusted PR commits to internal `pull-request/<N>` branches in this repository. The gated workflows trigger on pushes to those branches, not on the original PR.
