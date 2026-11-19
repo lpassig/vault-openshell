@@ -37,6 +37,8 @@ Unverified integration requirements: select and implement real requester/host at
 
 Verified implementation: CLI activation requires gateway TLS, Kubernetes gateway supervision, positive session TTLs, a SPIFFE broker, and no configured supervisor Workload API socket. Unverified deployment requirement: every replica sharing a gateway signing identity must enforce the same flag and policy; mixed enabled/disabled replicas allow a downgrade through the disabled replica. Operators must also prevent alternate Workload API access and authorization-server grant policies from bypassing gateway mediation. The gateway flag cannot revoke credentials or sockets already distributed outside its configuration.
 
+Verified boundary: Gate 2 guards provider credentials. Launch still prepares SSH identity and applies configured OTLP authentication headers/client TLS before Gate 2; see [`prepare_ssh_identity` and `encode_launch_authentication`](../../crates/openshell-server/src/compute/mod.rs). These are bootstrap infrastructure exceptions. Unverified deployment assumption: operators constrain their destinations and privileges. This slice does not establish workload/host attestation before those infrastructure credentials exist, nor resolve the design's open question about deferring them.
+
 Unverified follow-up work: proof-capable static-secret/configuration delivery, renewable sessions, runtime ownership changes with fresh admission, audit/proof receipt retention, real SPIRE Broker API transport integration tests, and deployment qualification. Decision and replay records are retained in this slice; production storage growth and retention require review. No claim of production readiness follows from mock-backed tests.
 
 ## Validation boundaries
@@ -45,7 +47,9 @@ Verified test coverage in source: core tests cover allow/deny, missing/expired a
 
 Verified test fixture: the gateway RPC integration uses an actual mock SPIRE Workload API over a Unix socket, a mock broker adapter that cryptographically validates its SVID, the real Vault credential driver against a mock Vault HTTP backend, and a mock OAuth endpoint. It checks that missing/wrong/replayed proofs and revoked posture cause zero additional Vault reads or OAuth exchanges. The broker's real X.509/mTLS transport is outside this fixture; this test does not qualify a SPIRE deployment. See [the integration fixture](../../crates/openshell-server/src/grpc/provider/access_token/bootstrap_tests.rs).
 
-Verified CI definition: [Bootstrap authorization](../../.github/workflows/bootstrap-authz.yml) pins OPA 1.22.4 with its binary checksum, runs the real Rego evaluator, and runs the core and gateway authentication/security tests. A workflow definition is not evidence of a successful run; execution results must be reported separately.
+Verified CI result for the initial slice at `fe853cdc`: [Bootstrap authorization run 44524632575](https://github.com/lpassig/vault-openshell/actions/runs/44524632575) passed formatting, core authorization with pinned OPA, gateway SPIRE/Vault/OAuth integration and existing authentication regressions.
+
+The [lifecycle integration design](03-lifecycle-integration.md) maps upstream configuration admission, native runtime binding and the backend protocol to the remaining cross-runtime credential activation work.
 
 ## Suggested PR description
 
