@@ -27,6 +27,8 @@ Verified implementation: the signed proof contains issuer `openshell-workload-pr
 
 Verified implementation: per-request permits stop reusable-bearer promotion from weakening the proof requirement. Already-exported upstream tokens remain bearer credentials with issuer-controlled lifetimes. Capping the gateway response/serving lifetime does not shorten the upstream token's cryptographic lifetime or revoke it after export. Operators still need upstream revocation, short issuer TTLs, or sender-constrained upstream credentials.
 
+Unverified threat analysis: a thief who captures both the bootstrap bearer and a valid, unconsumed signed proof can race the intended request. Atomic consumption guarantees at most one success, not which connection wins. Required gateway TLS protects transport confidentiality; the signed proof has no TLS-channel binding. Protecting against full-request theft requires a separately reviewed channel binding or encrypted credential delivery. The stolen-bearer test establishes protection only when the thief lacks a valid proof and the enrolled key.
+
 ## Stubs and deployment limits
 
 Verified implementation: the shipped `UnavailableDeviceAttestation` and `UnavailableSandboxAuthorization` adapters deny. Mocks exist only in tests. The CLI has no production enrollment, device-posture service, owner/mission authority connector, or supervisor proof signer. Enabling this flag with the shipped adapters therefore prevents admission; it does not silently trust request labels, service-account tokens, or a matching SVID.
@@ -54,6 +56,7 @@ The default adapters deny until a real verifier and authorization authority are 
 | Threat | Mitigation in this slice | Residual risk |
 | --- | --- | --- |
 | Stolen bootstrap JWT | Independently attested workload key and context-bound signed proof before provider access. | Compromised verifier or legitimate workload key defeats this boundary. |
+| Captured bearer and unconsumed proof | Gateway TLS, narrow request binding, short proof expiry and atomic consumption. | A thief can win the first-use race; TLS-channel binding or encrypted delivery is not implemented. |
 | Replayed proof or expired decision | Atomic persistent proof receipts, short proof/decision expiry, current grant lookup. | Receipt/audit retention and production scaling need qualification. |
 | Same-domain SVID for another sandbox | Exact configured SPIFFE mapping, sandbox/runtime/generation/epoch binding. | Incorrect or compromised SPIRE registrations remain a trust-root risk. |
 | Vault or cache bypass | Gate before subject resolution, cache bypass, denial of unguarded snapshot and legacy exchange paths. | Independent administrator exports and external grant paths require separate control. |
