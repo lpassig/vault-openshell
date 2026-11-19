@@ -1700,16 +1700,29 @@ Changing the flag invalidates existing sandbox JWTs issued in the previous
 mode. Revoking the stored grant blocks new authenticated bootstrap requests.
 
 On Kubernetes, configure `spiffe_broker` and `supervisor_topology = "gateway"`
-and omit the supervisor `provider_spiffe_workload_api_socket_path`. An
-integrated caller supplies a fresh `x-openshell-workload-proof` to
-`GetSandboxProviderAccessToken`. The gateway verifies an Ed25519 proof against
+and omit the supervisor `provider_spiffe_workload_api_socket_path`. Set
+`OPENSHELL_BOOTSTRAP_WORKLOAD_KEY_DIR` on the shared supervisor to an
+absolute local directory readable only by that supervisor and the trusted
+provisioner. Project only the assignments for that supervisor.
+The supervisor uses that directory to sign a fresh
+`x-openshell-workload-proof` for each `GetSandboxProviderAccessToken` call
+over HTTPS. The gateway verifies the Ed25519 proof against
 an independently attested workload key and binds it to the sandbox, generation,
 credential epoch, gateway bearer ID, admission decision, device, audience and
 configured credential. Proofs expire within 30 seconds and are single-use
 across gateway replicas. Bootstrap configuration carries metadata for dynamic
-grants. The OAuth exchange and Vault reads remain gated by workload proof.
-The stock Kubernetes supervisor still requires a workload key enrollment and
-signing integration.
+grants. The OAuth exchange and Vault reads require valid workload proof.
+
+Provision a private regular file named `<sandbox-id>.<generation>.<epoch>.json`
+in that directory. The file contains `gateway_id`, the driver's current
+`runtime_identity` (`kubernetes://<namespace>/<sandbox-uid>/<route>` for
+shared supervision), trusted gateway `verification_keys` (objects with
+`key_id` and the byte array `public_key_pem`), and the assignment's Ed25519
+`private_key_pem`. Use mode `0600` or `0400`. The supervisor rejects symlinks
+and reads the file when a provider request needs it. The posture authority
+must independently enroll the matching public key for the verified host
+and assignment. Provisioning and proof-bound renewal are external to this
+transport integration.
 
 On Docker, set `docker_spiffe_id_prefix` in the bootstrap authorization table,
 for example `"spiffe://example.org/openshell"`. Use `config_delivery_mode = "poll"`
