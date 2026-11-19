@@ -304,16 +304,7 @@ async fn bootstrap_docker_configuration_requires_the_live_mtls_supervisor() {
         .unwrap();
     let expected_spiffe = docker_supervisor_spiffe_id(&grant.intent, &observation).unwrap();
     identity.bootstrap = Some(grant.clone());
-    let annotations = &mut sandbox.metadata.as_mut().unwrap().annotations;
-    identity.write(annotations);
-    annotations.insert(
-        crate::compute::COMPUTE_DRIVER_ANNOTATION.into(),
-        "docker".into(),
-    );
-    annotations.insert(
-        crate::compute::COMPUTE_RUNTIME_IDENTITY_ANNOTATION.into(),
-        observation.runtime_identity.clone(),
-    );
+    identity.write(&mut sandbox.metadata.as_mut().unwrap().annotations);
     state.store.put_message(&sandbox).await.unwrap();
     let launch = authority
         .mint_persisted_launch(sandbox_id, &identity)
@@ -355,7 +346,7 @@ async fn bootstrap_docker_configuration_requires_the_live_mtls_supervisor() {
             .ca_certificate(Certificate::from_pem(ca.pem()))
             .domain_name("localhost");
         if let Some(id) = spiffe {
-            let mut params = rcgen::CertificateParams::default();
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
             params.subject_alt_names = vec![rcgen::SanType::URI(id.try_into().unwrap())];
             params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
             params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];

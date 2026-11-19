@@ -15,7 +15,8 @@ use openshell_core::bootstrap_authz::{
 use openshell_core::config::Config;
 use openshell_core::jwt::AuthenticatedSandboxSession;
 use openshell_core::proto::{
-    Provider, ProviderCredentialTokenGrant, Sandbox, SandboxConfigurationAdmission,
+    Provider, ProviderCredentialTokenGrant, ReportSandboxConfigurationRequest, Sandbox,
+    SandboxConfigurationAdmission,
 };
 use openshell_crypto::tls::spiffe::{SpiffeClientVerifier, VerifiedSpiffeClient};
 use openshell_spiffe::SandboxSpiffeIdPrefix;
@@ -269,10 +270,10 @@ impl BootstrapRuntime {
 
     /// Called after normal configuration admission checks. The caller commits
     /// this decision with the accepted configuration using the same CAS.
-    pub async fn authorize_docker_configuration<T>(
+    pub async fn authorize_docker_configuration(
         &self,
         state: &ServerState,
-        request: &tonic::Request<T>,
+        request: &tonic::Request<ReportSandboxConfigurationRequest>,
         sandbox: &Sandbox,
         admission: &SandboxConfigurationAdmission,
     ) -> Result<String, Status> {
