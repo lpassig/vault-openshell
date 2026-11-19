@@ -402,8 +402,10 @@ impl Authenticator for SandboxSessionJwtAuthenticator {
         let authenticated = self.authority.verify_gateway_token(token)?;
         if let Some(grant) = &authenticated.bootstrap {
             if !(bootstrap_callable(path)
-                || (matches!(grant.intent.driver.as_str(), "docker" | "kubernetes")
-                    && path == "/openshell.v1.OpenShell/GetSandboxProviderEnvironment"))
+                || (matches!(
+                    grant.intent.driver.as_str(),
+                    "docker" | "podman" | "kubernetes"
+                ) && path == "/openshell.v1.OpenShell/GetSandboxProviderEnvironment"))
             {
                 return Err(AuthRejection::new(
                     AuthMechanism::SandboxJwt,

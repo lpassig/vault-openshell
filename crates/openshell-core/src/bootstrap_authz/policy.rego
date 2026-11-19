@@ -33,7 +33,7 @@ decision := {"allow": true, "reason": "provider_admitted", "ttl_secs": 30, "scop
 
 decision := {"allow": true, "reason": "configuration_admitted", "ttl_secs": 30, "scopes": ["configuration_activation"]} if {
     input.stage == "activation"
-    input.intent.driver == "docker"
+    input.intent.driver in {"docker", "podman"}
     input.parent_decision_id != ""
     input.proof_verified
     count(input.selectors) > 0

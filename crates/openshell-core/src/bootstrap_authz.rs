@@ -611,7 +611,7 @@ impl BootstrapGate {
 
     /// Authorize one configuration acknowledgement on an authenticated SPIFFE
     /// connection. This capability confers no provider credential access.
-    pub async fn activate_docker(
+    pub async fn activate_local(
         &self,
         grant: &Grant,
         intent: &SandboxIntent,
@@ -628,7 +628,7 @@ impl BootstrapGate {
             if !grant.scopes.contains(BOOTSTRAP_CAPABILITY) || configuration_fence.is_empty() {
                 return Err(Denial::MissingSignal);
             }
-            let spiffe_id = docker_supervisor_spiffe_id(intent, observation)?;
+            let spiffe_id = local_supervisor_spiffe_id(intent, observation)?;
             let unix_time = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(
                 u64::try_from(now).map_err(|_| Denial::StaleEvidence)?,
             ));
@@ -806,13 +806,13 @@ fn digest(bytes: &[u8]) -> Result<String, Denial> {
         .encode(openshell_crypto::sha256(bytes).map_err(|_| Denial::Unavailable)?))
 }
 
-/// Expected X.509 identity for the sandbox's current Docker supervisor. The
+/// Expected X.509 identity for the sandbox's current local supervisor. The
 /// observation must be read from the configured, trusted compute driver.
-pub fn docker_supervisor_spiffe_id(
+pub fn local_supervisor_spiffe_id(
     intent: &SandboxIntent,
     observation: &crate::proto::compute::v1::SupervisorRuntimeObservation,
 ) -> Result<String, Denial> {
-    if intent.driver != "docker"
+    if !matches!(intent.driver.as_str(), "docker" | "podman")
         || observation.sandbox_id != intent.sandbox_id
         || observation.generation != intent.generation
         || observation.auth_epoch != intent.auth_epoch
@@ -821,16 +821,18 @@ pub fn docker_supervisor_spiffe_id(
     }
     let container_id = observation
         .runtime_identity
-        .strip_prefix("docker://")
-        .filter(|id| {
-            id.len() == 64
-                && id
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        })
+        .split_once("://")
+        .filter(|(driver, _)| *driver == intent.driver)
+        .map(|(_, id)| id)
+        .filter(|id| crate::driver_utils::is_full_container_id(id))
         .ok_or(Denial::IdentityMismatch)?;
+    let driver_segment = if intent.driver == "podman" {
+        "podman/"
+    } else {
+        ""
+    };
     let id = format!(
-        "{}/generation/{}/epoch/{}/supervisor/{container_id}",
+        "{}/generation/{}/epoch/{}/supervisor/{driver_segment}{container_id}",
         intent.expected_spiffe_id, intent.generation, intent.auth_epoch
     );
     openshell_spiffe::SandboxSpiffeIdPrefix::parse(&id).map_err(|_| Denial::IdentityMismatch)?;

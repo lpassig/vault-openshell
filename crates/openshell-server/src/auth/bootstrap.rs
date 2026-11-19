@@ -95,7 +95,7 @@ pub struct BootstrapRuntime {
     gateway_id: String,
     prefix: SandboxSpiffeIdPrefix,
     store: Arc<Store>,
-    docker_verifier: Option<SpiffeClientVerifier>,
+    local_verifier: Option<SpiffeClientVerifier>,
 }
 
 impl std::fmt::Debug for BootstrapRuntime {
@@ -126,23 +126,27 @@ impl BootstrapRuntime {
         if jwt.ttl_secs.is_none() {
             return Err("bootstrap_authorization requires positive gateway JWT TTL".into());
         }
-        let (prefix, docker_verifier) = if let Some(raw) = &settings.docker_spiffe_id_prefix {
-            if config.compute_driver.as_deref() != Some("docker")
+        let (prefix, local_verifier) = if let Some((driver, raw)) =
+            settings.local_spiffe_identity()?
+        {
+            if config.compute_driver.as_deref() != Some(driver)
                 || config.config_delivery_mode != openshell_core::config::ConfigDeliveryMode::Poll
                 || config.spiffe_broker.is_some()
                 || config.mtls_auth.enabled
                 || config.mtls_auth.operator_enabled
                 || tls.require_client_auth
             {
-                return Err("Docker bootstrap activation requires the Docker driver, polling, and optional TLS client certificates dedicated to SPIFFE".into());
+                return Err(format!(
+                    "{driver} bootstrap activation requires the matching driver, polling, and optional TLS client certificates dedicated to SPIFFE"
+                ));
             }
             let path = tls
                 .client_ca_path
                 .as_ref()
-                .ok_or("Docker bootstrap activation requires a SPIFFE client CA bundle")?;
+                .ok_or("local bootstrap activation requires a SPIFFE client CA bundle")?;
             let verifier = SpiffeClientVerifier::new(
                 openshell_spiffe::trust_domain(raw)
-                    .ok_or("invalid Docker SPIFFE trust domain")?
+                    .ok_or("invalid local SPIFFE trust domain")?
                     .into(),
                 load_client_roots(path)?,
             )
@@ -193,7 +197,7 @@ impl BootstrapRuntime {
             gateway_id: jwt.gateway_id.clone(),
             prefix,
             store,
-            docker_verifier,
+            local_verifier,
         })))
     }
 
@@ -204,22 +208,22 @@ impl BootstrapRuntime {
             gateway_id: "gateway-a".into(),
             prefix: SandboxSpiffeIdPrefix::parse("spiffe://example.org/openshell").unwrap(),
             store,
-            docker_verifier: None,
+            local_verifier: None,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn with_test_docker_verifier(mut self, verifier: SpiffeClientVerifier) -> Self {
-        self.docker_verifier = Some(verifier);
+    pub(crate) fn with_test_local_verifier(mut self, verifier: SpiffeClientVerifier) -> Self {
+        self.local_verifier = Some(verifier);
         self
     }
 
-    pub fn docker_activation_enabled(&self) -> bool {
-        self.docker_verifier.is_some()
+    pub fn local_activation_enabled(&self) -> bool {
+        self.local_verifier.is_some()
     }
 
     pub fn tls_peer(&self, connection: &rustls::ServerConnection) -> Option<VerifiedSpiffeClient> {
-        self.docker_verifier
+        self.local_verifier
             .as_ref()?
             .verify_peer(connection, UnixTime::now())
             .ok()
@@ -234,7 +238,7 @@ impl BootstrapRuntime {
         identity: &super::sandbox_session::PersistedSandboxIdentity,
         device_evidence: &str,
     ) -> Result<Grant, Status> {
-        if self.docker_activation_enabled() {
+        if self.local_activation_enabled() {
             Self::require_credential_free(sandbox)?;
         }
         let owner = principal
@@ -288,7 +292,7 @@ impl BootstrapRuntime {
             .is_none_or(|spec| !spec.providers.is_empty())
         {
             return Err(Status::permission_denied(
-                "Docker bootstrap activation does not deliver provider credentials",
+                "local bootstrap activation does not deliver provider credentials",
             ));
         }
         Ok(())
@@ -296,7 +300,7 @@ impl BootstrapRuntime {
 
     /// Called after normal configuration admission checks. The caller commits
     /// this decision with the accepted configuration using the same CAS.
-    pub async fn authorize_docker_configuration(
+    pub async fn authorize_local_configuration(
         &self,
         state: &ServerState,
         request: &tonic::Request<ReportSandboxConfigurationRequest>,
@@ -357,7 +361,7 @@ impl BootstrapRuntime {
         ))?;
         let decision = self
             .gate
-            .activate_docker(
+            .activate_local(
                 grant,
                 &intent,
                 &observation,
@@ -368,7 +372,7 @@ impl BootstrapRuntime {
             .await
             .map_err(status)?;
         let spiffe_id =
-            openshell_core::bootstrap_authz::docker_supervisor_spiffe_id(&intent, &observation)
+            openshell_core::bootstrap_authz::local_supervisor_spiffe_id(&intent, &observation)
                 .map_err(status)?;
         if read_observation().await? != observation {
             return Err(status(Denial::IdentityMismatch));

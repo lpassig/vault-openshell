@@ -3950,7 +3950,7 @@ pub async fn build_provider_environment_snapshot_from_inputs(
     supports_stable_placeholder_environment_keys: bool,
 ) -> Result<ProviderEnvironmentSnapshot, Status> {
     if let Some(gate) = &state.bootstrap_authorization
-        && gate.docker_activation_enabled()
+        && gate.local_activation_enabled()
     {
         crate::auth::bootstrap::BootstrapRuntime::require_credential_free(&inputs.sandbox)?;
         let config = build_sandbox_config_snapshot_from_inputs(state, inputs).await?;
@@ -5215,16 +5215,16 @@ pub(super) async fn handle_report_sandbox_configuration(
         .metadata
         .as_ref()
         .map_or(0, |metadata| metadata.resource_version);
-    let docker_activation = state
+    let local_activation = state
         .bootstrap_authorization
         .as_ref()
-        .filter(|runtime| runtime.docker_activation_enabled());
-    let activation = if let Some(runtime) = docker_activation
+        .filter(|runtime| runtime.local_activation_enabled());
+    let activation = if let Some(runtime) = local_activation
         && reported == ConfigurationAdmissionState::Accepted
     {
         Some(
             runtime
-                .authorize_docker_configuration(state, &request, &sandbox, &admission)
+                .authorize_local_configuration(state, &request, &sandbox, &admission)
                 .await
                 .inspect_err(|_| {
                     crate::auth::audit::emit_authorization_denial(
@@ -5268,7 +5268,7 @@ pub(super) async fn handle_report_sandbox_configuration(
     let updated = state
         .store
         .update_message_cas::<Sandbox, _>(&sandbox_id, expected_version, |sandbox| {
-            if docker_activation.is_some()
+            if local_activation.is_some()
                 && let Some(metadata) = sandbox.metadata.as_mut()
             {
                 use crate::auth::bootstrap::ACTIVATION_ANNOTATION;

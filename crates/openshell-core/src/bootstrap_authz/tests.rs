@@ -481,7 +481,7 @@ async fn local_rego_policy_allows_and_denies() {
     };
     let mut activation = DecisionRequest {
         stage: Stage::Activation,
-        spiffe_id: Some(docker_supervisor_spiffe_id(&docker, &observation).unwrap()),
+        spiffe_id: Some(local_supervisor_spiffe_id(&docker, &observation).unwrap()),
         intent: docker,
         host_id: Some("host-a".into()),
         runtime_identity: Some(observation.runtime_identity),
@@ -491,6 +491,12 @@ async fn local_rego_policy_allows_and_denies() {
         resource: "configuration-fence".into(),
         ..invalid_request
     };
+    let allowed = gate.authorizer.decide(&activation).await.unwrap();
+    assert_eq!(
+        validate_response(&activation, &allowed, ACTIVATION_CAPABILITY),
+        Ok(NOW + 30)
+    );
+    activation.intent.driver = "podman".into();
     let allowed = gate.authorizer.decide(&activation).await.unwrap();
     assert_eq!(
         validate_response(&activation, &allowed, ACTIVATION_CAPABILITY),

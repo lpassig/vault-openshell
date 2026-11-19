@@ -11,6 +11,7 @@ on:
       - "crates/openshell-cli/**"
       - "crates/openshell-crypto/**"
       - "crates/openshell-driver-docker/**"
+      - "crates/openshell-driver-podman/**"
       - "crates/openshell-server/**"
       - "crates/openshell-spire/**"
       - "crates/openshell-supervisor/**"
@@ -24,6 +25,7 @@ on:
       - "crates/openshell-cli/**"
       - "crates/openshell-crypto/**"
       - "crates/openshell-driver-docker/**"
+      - "crates/openshell-driver-podman/**"
       - "crates/openshell-server/**"
       - "crates/openshell-spire/**"
       - "crates/openshell-supervisor/**"
@@ -70,6 +72,8 @@ jobs:
         run: cargo test --locked -p openshell-crypto --lib --test spiffe_client
       - name: Docker supervisor observation
         run: cargo test --locked -p openshell-driver-docker --lib bootstrap_
+      - name: Podman supervisor observation and socket isolation
+        run: cargo test --locked -p openshell-driver-podman --lib bootstrap_
       - name: Supervisor SPIFFE transport
         run: cargo check --locked -p openshell-supervisor
       - name: CLI evidence transport

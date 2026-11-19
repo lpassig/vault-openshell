@@ -819,53 +819,56 @@ fn prepare_server_config_with_drivers(
     config.bootstrap_authorization = file
         .as_ref()
         .and_then(|file| file.openshell.gateway.bootstrap_authorization.clone());
-    let docker = file
-        .as_ref()
-        .and_then(|file| file.openshell.drivers.get("docker"));
-    if docker
-        .and_then(|driver| driver.get("bootstrap_spiffe_workload_api_socket"))
-        .is_some()
-        && config
-            .bootstrap_authorization
-            .as_ref()
-            .is_none_or(|settings| !settings.enabled || settings.docker_spiffe_id_prefix.is_none())
-    {
-        return Err(miette::miette!(
-            "Docker bootstrap SPIFFE socket requires Docker bootstrap authorization"
-        ));
-    }
-    if let Some(settings) = config
+    let bootstrap_settings = config
         .bootstrap_authorization
         .as_ref()
-        .filter(|s| s.enabled)
-    {
-        if settings.docker_spiffe_id_prefix.is_some() {
-            if docker
+        .filter(|s| s.enabled);
+    let local_identity = bootstrap_settings
+        .map(openshell_core::config::BootstrapAuthorizationConfig::local_spiffe_identity)
+        .transpose()
+        .map_err(|error| miette::miette!("{error}"))?
+        .flatten();
+    for driver in ["docker", "podman"] {
+        let options = file
+            .as_ref()
+            .and_then(|file| file.openshell.drivers.get(driver));
+        let local_activation = local_identity.is_some_and(|(name, _)| name == driver);
+        if options
+            .and_then(|d| d.get("bootstrap_spiffe_workload_api_socket"))
+            .is_some()
+            && (!local_activation || config.compute_driver.as_deref() != Some(driver))
+        {
+            return Err(miette::miette!(
+                "{driver} bootstrap SPIFFE socket requires {driver} bootstrap authorization"
+            ));
+        }
+        if local_activation
+            && options
                 .and_then(|d| d.get("provider_spiffe_workload_api_socket"))
                 .is_some()
-            {
-                return Err(miette::miette!(
-                    "Docker bootstrap activation cannot use the provider SPIFFE socket"
-                ));
-            }
-        } else {
-            let driver = file
-                .as_ref()
-                .and_then(|f| f.openshell.drivers.get("kubernetes"));
-            if config.compute_driver.as_deref() != Some("kubernetes")
-                || driver
-                    .and_then(|d| d.get("supervisor_topology"))
-                    .and_then(toml::Value::as_str)
-                    != Some("gateway")
-                || driver
-                    .and_then(|d| d.get("provider_spiffe_workload_api_socket_path"))
-                    .and_then(toml::Value::as_str)
-                    .is_some_and(|s| !s.is_empty())
-            {
-                return Err(miette::miette!(
-                    "bootstrap authorization requires Kubernetes gateway supervision with no supervisor Workload API socket"
-                ));
-            }
+        {
+            return Err(miette::miette!(
+                "{driver} bootstrap activation cannot use the provider SPIFFE socket"
+            ));
+        }
+    }
+    if bootstrap_settings.is_some() && local_identity.is_none() {
+        let driver = file
+            .as_ref()
+            .and_then(|f| f.openshell.drivers.get("kubernetes"));
+        if config.compute_driver.as_deref() != Some("kubernetes")
+            || driver
+                .and_then(|d| d.get("supervisor_topology"))
+                .and_then(toml::Value::as_str)
+                != Some("gateway")
+            || driver
+                .and_then(|d| d.get("provider_spiffe_workload_api_socket_path"))
+                .and_then(toml::Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        {
+            return Err(miette::miette!(
+                "bootstrap authorization requires Kubernetes gateway supervision with no supervisor Workload API socket"
+            ));
         }
     }
 

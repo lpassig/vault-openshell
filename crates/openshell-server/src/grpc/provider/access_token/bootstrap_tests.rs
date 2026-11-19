@@ -275,6 +275,15 @@ impl Drop for AbortServer {
 
 #[tokio::test]
 async fn bootstrap_docker_configuration_requires_the_live_mtls_supervisor() {
+    run_local_configuration_admission("docker").await;
+}
+
+#[tokio::test]
+async fn bootstrap_podman_configuration_requires_the_live_mtls_supervisor() {
+    run_local_configuration_admission("podman").await;
+}
+
+async fn run_local_configuration_admission(driver_name: &'static str) {
     let directory = crate::test_environment::fixture_dir().unwrap();
     crate::test_environment::Environment::new()
         .set(
@@ -282,11 +291,14 @@ async fn bootstrap_docker_configuration_requires_the_live_mtls_supervisor() {
             directory.path().join("ca.pem"),
         )
         .remove(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME)
-        .run_async(assert_docker_configuration_admission(directory.path()))
+        .run_async(assert_local_configuration_admission(
+            directory.path(),
+            driver_name,
+        ))
         .await;
 }
 
-async fn assert_docker_configuration_admission(directory: &std::path::Path) {
+async fn assert_local_configuration_admission(directory: &std::path::Path, driver_name: &str) {
     use crate::auth::bootstrap::{
         ACTIVATION_ANNOTATION, BootstrapRuntime, PersistentDecisionStore,
     };
@@ -304,7 +316,7 @@ async fn assert_docker_configuration_admission(directory: &std::path::Path) {
     let mut identity = PersistedSandboxIdentity::new().unwrap();
     let observation = SupervisorRuntimeObservation {
         sandbox_id: sandbox_id.into(),
-        runtime_identity: format!("docker://{}", "a".repeat(64)),
+        runtime_identity: format!("{driver_name}://{}", "a".repeat(64)),
         generation: identity.runtime_generation.as_str().into(),
         auth_epoch: identity.auth_epoch.get(),
     };
@@ -312,7 +324,7 @@ async fn assert_docker_configuration_admission(directory: &std::path::Path) {
         observation.clone(),
     ));
     let mut state =
-        crate::grpc::test_support::test_server_state_with_compute_driver("docker", driver).await;
+        crate::grpc::test_support::test_server_state_with_compute_driver(driver_name, driver).await;
     let (ca, ca_key) = crate::tls_test_utils::generate_test_certs_with_ca(directory);
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca.der().clone()).unwrap();
@@ -344,7 +356,7 @@ async fn assert_docker_configuration_admission(directory: &std::path::Path) {
     };
     let runtime = Arc::new(
         BootstrapRuntime::with_test_gate(state.store.clone(), gate)
-            .with_test_docker_verifier(verifier),
+            .with_test_local_verifier(verifier),
     );
     let state_mut = Arc::get_mut(&mut state).unwrap();
     state_mut.config.config_delivery_mode = openshell_core::config::ConfigDeliveryMode::Poll;
@@ -383,7 +395,7 @@ async fn assert_docker_configuration_admission(directory: &std::path::Path) {
         )
         .await
         .unwrap();
-    let expected_spiffe = docker_supervisor_spiffe_id(&grant.intent, &observation).unwrap();
+    let expected_spiffe = local_supervisor_spiffe_id(&grant.intent, &observation).unwrap();
     identity.bootstrap = Some(grant.clone());
     identity.write(&mut sandbox.metadata.as_mut().unwrap().annotations);
     state.store.put_message(&sandbox).await.unwrap();
@@ -488,10 +500,16 @@ async fn assert_docker_configuration_admission(directory: &std::path::Path) {
     };
     let wrong_container = expected_spiffe.replace(&"a".repeat(64), &"b".repeat(64));
     let wrong_generation = expected_spiffe.replace(&observation.generation, "old-generation");
+    let wrong_runtime = if driver_name == "podman" {
+        expected_spiffe.replace("/supervisor/podman/", "/supervisor/")
+    } else {
+        expected_spiffe.replace("/supervisor/", "/supervisor/podman/")
+    };
     for mut client in [
         bearer_only,
         connect(Some(&wrong_container)).await,
         connect(Some(&wrong_generation)).await,
+        connect(Some(&wrong_runtime)).await,
     ] {
         let error = client
             .report_sandbox_configuration(report(accepted.clone()))

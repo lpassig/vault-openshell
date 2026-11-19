@@ -277,6 +277,9 @@ pub struct BootstrapAuthorizationConfig {
     /// Enables the Docker polling activation prototype with this SPIFFE prefix.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docker_spiffe_id_prefix: Option<String>,
+    /// Enables Podman polling activation with this SPIFFE prefix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub podman_spiffe_id_prefix: Option<String>,
     /// Trusted posture verifier for requester and running-host evidence.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub posture_authority: Option<BootstrapPostureAuthorityConfig>,
@@ -290,6 +293,21 @@ pub struct BootstrapPostureAuthorityConfig {
     pub client_identity_pem: PathBuf,
 }
 
+impl BootstrapAuthorizationConfig {
+    /// The local driver selected for SPIFFE-authenticated configuration polling.
+    pub fn local_spiffe_identity(&self) -> Result<Option<(&'static str, &str)>, &'static str> {
+        match (
+            self.docker_spiffe_id_prefix.as_deref(),
+            self.podman_spiffe_id_prefix.as_deref(),
+        ) {
+            (Some(prefix), None) => Ok(Some(("docker", prefix))),
+            (None, Some(prefix)) => Ok(Some(("podman", prefix))),
+            (None, None) => Ok(None),
+            (Some(_), Some(_)) => Err("configure only one local bootstrap SPIFFE prefix"),
+        }
+    }
+}
+
 impl Default for BootstrapAuthorizationConfig {
     fn default() -> Self {
         Self {
@@ -297,6 +315,7 @@ impl Default for BootstrapAuthorizationConfig {
             opa_executable: PathBuf::from("opa"),
             timeout_ms: 2000,
             docker_spiffe_id_prefix: None,
+            podman_spiffe_id_prefix: None,
             posture_authority: None,
         }
     }
