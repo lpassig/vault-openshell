@@ -3103,6 +3103,7 @@ mod tests {
                 auth_epoch: CredentialEpoch::new(1).unwrap(),
                 gateway_token_id: Uuid::new_v4(),
                 refresh_replay: None,
+                bootstrap: None,
             };
             let mut metadata = ObjectMeta {
                 id: sandbox_id.to_string(),
@@ -3462,6 +3463,7 @@ mod tests {
             token_id: launch_identity.gateway_token_id,
             issued_at: 1,
             expires_at: 2,
+            bootstrap: None,
         };
         assert!(
             crate::auth::sandbox_session::authorize_persisted(&fixture.store, &stale)

@@ -11,6 +11,7 @@
 pub mod audit;
 pub mod authenticator;
 pub mod authz;
+pub mod bootstrap;
 pub mod compute_driver;
 pub mod descriptor_authz;
 pub mod extension_mint_limit;

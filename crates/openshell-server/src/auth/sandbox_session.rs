@@ -97,6 +97,7 @@ fn derive_token_id(rotation_id: Uuid, label: &[u8]) -> Result<Uuid, CryptoError>
 /// The complete durable authorization identity for one sandbox runtime.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PersistedSandboxIdentity {
+    pub bootstrap: Option<openshell_core::bootstrap_identity::Grant>,
     pub runtime_generation: SandboxGenerationId,
     pub auth_epoch: CredentialEpoch,
     pub gateway_token_id: Uuid,
@@ -111,6 +112,7 @@ impl PersistedSandboxIdentity {
             auth_epoch: CredentialEpoch::new(1)?,
             gateway_token_id: Uuid::new_v4(),
             refresh_replay: None,
+            bootstrap: None,
         })
     }
 
@@ -174,10 +176,25 @@ impl PersistedSandboxIdentity {
             auth_epoch,
             gateway_token_id,
             refresh_replay,
+            bootstrap: annotations
+                .get("internal.openshell.ai/bootstrap-grant")
+                .map(|v| {
+                    serde_json::from_str(v).map_err(|_| SessionJwtError::InvalidRuntimeIdentity)
+                })
+                .transpose()?,
         })
     }
 
     pub fn write(&self, annotations: &mut HashMap<String, String>) {
+        if let Some(grant) = &self.bootstrap {
+            // Grant consists only of owned strings, integer times and a string set.
+            annotations.insert(
+                "internal.openshell.ai/bootstrap-grant".into(),
+                serde_json::to_string(grant).expect("serializable bootstrap grant"),
+            );
+        } else {
+            annotations.remove("internal.openshell.ai/bootstrap-grant");
+        }
         annotations.insert(
             RUNTIME_GENERATION_ANNOTATION.to_string(),
             self.runtime_generation.to_string(),
@@ -235,6 +252,7 @@ impl PersistedSandboxIdentity {
             runtime_generation: self.runtime_generation.clone(),
             auth_epoch: self.auth_epoch,
             gateway_token_id: derive_token_id(rotation_id, b"gateway")?,
+            bootstrap: self.bootstrap.clone(),
             refresh_replay: Some(GatewayRefreshReplay {
                 previous_gateway_token_id: self.gateway_token_id,
                 request_hash,
@@ -310,6 +328,7 @@ async fn load_identity(
     })?;
     if principal.runtime_generation != identity.runtime_generation
         || principal.auth_epoch != identity.auth_epoch
+        || principal.bootstrap != identity.bootstrap
     {
         return Err(stale_identity());
     }
@@ -492,6 +511,7 @@ pub async fn advance_identity_for_takeover(
             auth_epoch,
             gateway_token_id,
             refresh_replay: None,
+            bootstrap: None,
         };
         match store
             .update_message_cas::<Sandbox, _>(sandbox_id, metadata.resource_version, |sandbox| {
@@ -548,6 +568,7 @@ mod tests {
     }
     async fn persist_sandbox(store: &Store, phase: SandboxPhase) {
         let identity = PersistedSandboxIdentity {
+            bootstrap: None,
             runtime_generation: SandboxGenerationId::parse("generation-a")
                 .expect("runtime generation"),
             auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
@@ -581,6 +602,7 @@ mod tests {
             token_id,
             issued_at: 1,
             expires_at: 2,
+            bootstrap: None,
         }
     }
 
@@ -605,6 +627,7 @@ mod tests {
         store
             .update_message_cas::<Sandbox, _>("sandbox-a", 0, |sandbox| {
                 let next = PersistedSandboxIdentity {
+                    bootstrap: None,
                     runtime_generation: SandboxGenerationId::parse("generation-a")
                         .expect("runtime generation"),
                     auth_epoch: CredentialEpoch::new(2).expect("auth epoch"),

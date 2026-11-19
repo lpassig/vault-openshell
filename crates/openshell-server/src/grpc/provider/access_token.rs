@@ -246,6 +246,37 @@ async fn obtain(
     let key = &request.get_ref().credential_key;
     let configured = grant_configuration(state, session.sandbox_id.as_str(), key).await?;
     let grant = &configured.grant;
+    let permit = if let Some(gate) = &state.bootstrap_authorization {
+        let mut proofs = request
+            .metadata()
+            .get_all(crate::auth::bootstrap::PROOF_HEADER)
+            .iter();
+        let proof = proofs
+            .next()
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        if proofs.next().is_some() {
+            return Err(gate
+                .reject(session.sandbox_id.as_str(), "ambiguous_workload_proof")
+                .await);
+        }
+        let audience = effective_jwt_svid_audience(&grant.token_endpoint, &grant.jwt_svid_audience);
+        let permit = gate
+            .provider_permit(
+                state,
+                &session,
+                proof,
+                &configured.key,
+                &audience,
+                (&configured.provider, grant),
+            )
+            .await?;
+        authorize(state, &bearer).await?;
+        gate.recheck(state, &session, &permit).await?;
+        Some(permit)
+    } else {
+        None
+    };
     let ttl_override = grant
         .cache_ttl
         .as_ref()
@@ -288,7 +319,9 @@ async fn obtain(
     let subject_value = subject.as_ref().map(|subject| subject.value.as_str());
     let fingerprint = cache_key(&session, &configured, subject_value, gateway_id)?;
     // A zero override disables caching, and with it shared acquisition.
-    let caching = ttl_override != Some(Duration::ZERO);
+    // A proof authorizes one operation. Enabled mode neither serves nor populates
+    // legacy caches whose entries have no decision/evidence version binding.
+    let caching = ttl_override != Some(Duration::ZERO) && permit.is_none();
     let mut refresh = false;
     loop {
         let cached = || {
@@ -325,6 +358,7 @@ async fn obtain(
                     subject.as_ref(),
                     ttl_override,
                     request_id,
+                    permit.as_ref(),
                 )
                 .await
                 .inspect_err(|status| {
@@ -344,8 +378,14 @@ async fn obtain(
             ));
         }
         authorize(state, &bearer).await?;
+        if let (Some(gate), Some(permit)) = (&state.bootstrap_authorization, &permit) {
+            gate.recheck(state, &session, permit).await?;
+        }
         // The lifetime runs from when the token service answered, so time spent
         // in the final validation counts against it.
+        let serve_until_ms = permit.as_ref().map_or(serve_until_ms, |p| {
+            serve_until_ms.min(p.expires_at.saturating_mul(1000))
+        });
         let remaining_ms = serve_until_ms.saturating_sub(crate::persistence::current_time_ms());
         if remaining_ms <= 0 && !acquired {
             // A hit can expire during the final asynchronous checks. Refresh once;
@@ -388,8 +428,12 @@ async fn acquire(
     subject: Option<&Subject>,
     ttl_override: Option<Duration>,
     request_id: Option<&str>,
+    permit: Option<&openshell_core::bootstrap_identity::Grant>,
 ) -> Result<(oauth::OAuthTokenResponse, i64), Status> {
     authorize(state, bearer).await?;
+    if let (Some(gate), Some(permit)) = (&state.bootstrap_authorization, permit) {
+        gate.recheck(state, session, permit).await?;
+    }
     let audience = effective_jwt_svid_audience(&grant.token_endpoint, &grant.jwt_svid_audience);
     let sandbox = state
         .store
@@ -417,6 +461,9 @@ async fn acquire(
         .map_err(TokenGrantFailure::to_status)?;
     authorize(state, bearer).await?;
     let client = token_exchange_http_client()?;
+    if let (Some(gate), Some(permit)) = (&state.bootstrap_authorization, permit) {
+        gate.recheck(state, session, permit).await?;
+    }
     let subject_expiry = subject.and_then(|subject| subject.expires_at_ms);
     let token = if let Some(subject) = subject {
         let component_svid = fetch_gateway_jwt_svid_from(
@@ -428,6 +475,9 @@ async fn acquire(
                 .map(|broker| broker.workload_api_socket_path.as_str()),
         )
         .await?;
+        if let (Some(gate), Some(permit)) = (&state.bootstrap_authorization, permit) {
+            gate.recheck(state, session, permit).await?;
+        }
         let intermediate = perform_intermediate_token_exchange(
             &grant.token_endpoint,
             &TokenExchangeParams {
@@ -443,6 +493,9 @@ async fn acquire(
         )
         .await?;
         authorize(state, bearer).await?;
+        if let (Some(gate), Some(permit)) = (&state.bootstrap_authorization, permit) {
+            gate.recheck(state, session, permit).await?;
+        }
         oauth::post_oauth_token_exchange(
             client,
             &grant.token_endpoint,
@@ -702,6 +755,7 @@ mod tests {
     fn fingerprint_binds_the_runtime_configured_key_and_resolved_subject() {
         use openshell_core::jwt::{CredentialEpoch, SandboxId};
         let session = AuthenticatedSandboxSession {
+            bootstrap: None,
             sandbox_id: SandboxId::parse(uuid::Uuid::new_v4().to_string()).unwrap(),
             runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
                 "g1",
@@ -870,3 +924,6 @@ mod tests {
         assert!(acquisitions.lock().is_empty());
     }
 }
+
+#[cfg(all(test, unix))]
+mod bootstrap_tests;

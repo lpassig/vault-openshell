@@ -558,6 +558,18 @@ async fn handle_create_sandbox_inner(
     request: Request<CreateSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let mut device_headers = request
+        .metadata()
+        .get_all(crate::auth::bootstrap::DEVICE_HEADER)
+        .iter();
+    let device_evidence = device_headers
+        .next()
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    if state.bootstrap_authorization.is_some() && device_headers.next().is_some() {
+        return Err(Status::permission_denied("ambiguous device evidence"));
+    }
     let request = request.into_inner();
     let await_main_process_attachment = request.await_main_process_attachment;
     let workload_template_name = request.workload_template.trim().to_string();
@@ -789,8 +801,20 @@ async fn handle_create_sandbox_inner(
             status
         })?;
 
-    let runtime_identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new()
+    let mut runtime_identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new()
         .map_err(|error| Status::internal(error.to_string()))?;
+    if let Some(gate) = &state.bootstrap_authorization {
+        runtime_identity.bootstrap = Some(
+            gate.admit(
+                state,
+                &principal,
+                &sandbox,
+                &runtime_identity,
+                &device_evidence,
+            )
+            .await?,
+        );
+    }
     if let Some(metadata) = sandbox.metadata.as_mut() {
         runtime_identity.write(&mut metadata.annotations);
     }

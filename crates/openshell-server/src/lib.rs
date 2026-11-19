@@ -419,6 +419,7 @@ pub struct ServerState {
 
     /// Launch-scoped gateway and Sandbox Protocol token authority.
     pub sandbox_session_jwt_authority: Option<Arc<auth::sandbox_jwt::SandboxSessionJwtAuthority>>,
+    pub bootstrap_authorization: Option<Arc<auth::bootstrap::BootstrapRuntime>>,
 
     /// Optional selected-driver authenticator for the `IssueSandboxToken`
     /// bootstrap path.
@@ -662,6 +663,9 @@ impl ServerState {
     ) -> Result<Self> {
         let sandbox_identity =
             spiffe_broker::sandbox_identity_provider(&config).map_err(Error::config)?;
+        let bootstrap_authorization =
+            auth::bootstrap::BootstrapRuntime::from_config(&config, store.clone())
+                .map_err(Error::config)?;
         let replica_id = compute::lease::replica_id();
         let compute = compute.with_sandbox_updates(config.enable_sandbox_updates);
         compute.configure_ssh_identities(credentials.clone());
@@ -712,6 +716,7 @@ impl ServerState {
             oidc_cache,
             extension_jwt_issuer: None,
             sandbox_session_jwt_authority: None,
+            bootstrap_authorization,
             compute_driver_authenticator: None,
             peer_authenticator: None,
             logons: auth::audit::Logons::default(),
@@ -828,6 +833,15 @@ pub(crate) async fn run_server(
     let (extension_jwt_issuer, sandbox_session_jwt_authority) =
         if let Some(ref jwt) = config.gateway_jwt {
             let authorities = auth::launch_signing::load(jwt)?;
+            if config
+                .bootstrap_authorization
+                .as_ref()
+                .is_some_and(|s| s.enabled)
+            {
+                authorities
+                    .sandbox_session
+                    .require_bootstrap_authorization();
+            }
             info!(
                 gateway_id = %jwt.gateway_id,
                 ttl_secs = jwt.ttl_secs.map(std::num::NonZeroU64::get),

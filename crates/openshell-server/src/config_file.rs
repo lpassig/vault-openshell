@@ -230,6 +230,8 @@ pub struct GatewayFileSection {
     pub gateway_jwt: Option<GatewayJwtConfig>,
     #[serde(default)]
     pub spiffe_broker: Option<openshell_core::config::SpiffeBrokerConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_authorization: Option<openshell_core::config::BootstrapAuthorizationConfig>,
     #[serde(default)]
     pub otlp: Option<OtlpConfig>,
     #[serde(default)]

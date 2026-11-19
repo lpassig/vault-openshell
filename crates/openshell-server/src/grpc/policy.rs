@@ -3788,7 +3788,7 @@ pub(super) async fn handle_get_gateway_config(
 
 /// Resolve the effective create-time policy without exporting credential state.
 /// Provider refresh and secret delivery remain in the supervisor session.
-pub(super) async fn resolve_sandbox_create_runtime_inputs(
+pub async fn resolve_sandbox_create_runtime_inputs(
     state: &ServerState,
     sandbox: &Sandbox,
 ) -> Result<crate::compute::SandboxCreateRuntimeInputs, Status> {
@@ -3949,6 +3949,11 @@ pub async fn build_provider_environment_snapshot_from_inputs(
     supports_static_credential_bindings: bool,
     supports_stable_placeholder_environment_keys: bool,
 ) -> Result<ProviderEnvironmentSnapshot, Status> {
+    if let Some(gate) = &state.bootstrap_authorization {
+        return Err(gate
+            .reject(inputs.sandbox.object_id(), "provider_environment")
+            .await);
+    }
     let sandbox_id = inputs.sandbox.object_id().to_string();
     let ProviderEnvironmentTarget {
         spec,

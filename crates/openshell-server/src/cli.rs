@@ -816,6 +816,32 @@ fn prepare_server_config_with_drivers(
     config.spiffe_broker = file
         .as_ref()
         .and_then(|file| file.openshell.gateway.spiffe_broker.clone());
+    config.bootstrap_authorization = file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.bootstrap_authorization.clone());
+    if config
+        .bootstrap_authorization
+        .as_ref()
+        .is_some_and(|s| s.enabled)
+    {
+        let driver = file
+            .as_ref()
+            .and_then(|f| f.openshell.drivers.get("kubernetes"));
+        if config.compute_driver.as_deref() != Some("kubernetes")
+            || driver
+                .and_then(|d| d.get("supervisor_topology"))
+                .and_then(toml::Value::as_str)
+                != Some("gateway")
+            || driver
+                .and_then(|d| d.get("provider_spiffe_workload_api_socket_path"))
+                .and_then(toml::Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        {
+            return Err(miette::miette!(
+                "bootstrap authorization requires Kubernetes gateway supervision with no supervisor Workload API socket"
+            ));
+        }
+    }
 
     if let Some(kubernetes) = file
         .as_ref()

@@ -1774,7 +1774,7 @@ fn resolve_dynamic_credentials_from_records(
     Ok(dynamic_creds)
 }
 
-fn insert_dynamic_credentials_for_profile(
+pub fn insert_dynamic_credentials_for_profile(
     dynamic_creds: &mut HashMap<String, ProviderProfileCredential>,
     profile: &ProviderTypeProfile,
     provider_name: &str,
@@ -3404,7 +3404,7 @@ pub(super) async fn handle_delete_provider_profile(
     }))
 }
 
-pub(super) fn get_provider_type_profile_for_scope(
+pub fn get_provider_type_profile_for_scope(
     catalog: &EffectiveProviderProfileCatalog,
     id: &str,
     profile_workspace: &str,
@@ -4407,6 +4407,13 @@ async fn exchange_provider_subject_token_inner(
     request: Request<ExchangeProviderSubjectTokenRequest>,
     request_id: Option<&str>,
 ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
+    if let Some(gate) = &state.bootstrap_authorization {
+        let id = match request.extensions().get::<Principal>() {
+            Some(Principal::Sandbox(p)) => p.sandbox_id.as_str(),
+            _ => "",
+        };
+        return Err(gate.reject(id, "legacy_subject_token_exchange").await);
+    }
     let req = request.get_ref().clone();
     // This RPC requires the exact sandbox supervisor. Check without emitting
     // caller-controlled identity fields through the general scope guard's log.

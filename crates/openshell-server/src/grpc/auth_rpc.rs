@@ -157,6 +157,15 @@ pub async fn handle_issue_sandbox_token(
                     Status::permission_denied("sandbox runtime identity is invalid"),
                 )
             })?;
+    if let Some(gate) = &state.bootstrap_authorization {
+        gate.verify_grant(
+            identity
+                .bootstrap
+                .as_ref()
+                .ok_or_else(|| Status::permission_denied("bootstrap admission required"))?,
+        )
+        .await?;
+    }
     audit::emit_handler_logon(&state.logons, &principal, request.metadata().as_ref());
     let authentication = session_authority.mint_persisted_launch(&sandbox.sandbox_id, &identity)?;
     let token = authentication
@@ -247,6 +256,15 @@ pub async fn handle_refresh_sandbox_token(
     state: &Arc<ServerState>,
     request: Request<RefreshSandboxTokenRequest>,
 ) -> Result<Response<RefreshSandboxTokenResponse>, Status> {
+    // The first slice has a fixed bootstrap deadline. Renewal must not extend it
+    // or release extension credentials without a fresh proof-capable protocol.
+    if let Some(gate) = &state.bootstrap_authorization {
+        let id = match request.extensions().get::<Principal>() {
+            Some(Principal::Sandbox(p)) => p.sandbox_id.as_str(),
+            _ => "",
+        };
+        return Err(gate.reject(id, "session_renewal").await);
+    }
     let requested_extension_services = request.get_ref().extension_service_names.clone();
     let principal = request
         .extensions()
@@ -1441,6 +1459,7 @@ mod tests {
                 auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).expect("auth epoch"),
                 gateway_token_id: uuid::Uuid::new_v4(),
                 refresh_replay: None,
+                bootstrap: None,
             },
         )
         .await;

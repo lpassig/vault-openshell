@@ -18,6 +18,23 @@ Retries reuse that generation and session, including after gateway restart.
 Credential renewal retains both; credentials for an older launch cannot
 authorize the new one.
 
+## Experimental bootstrap authorization
+
+`auth::bootstrap` wires the shared core `BootstrapGate` into launch admission
+and the gateway-owned provider-token path. The runtime flag defaults off.
+`PersistentDecisionStore` stores decisions, grants and single-use proof receipts
+under distinct object-ID namespaces because the object table has a global
+primary key. Bootstrap JWTs carry the admitted identity, restricted capabilities
+and an absolute expiry; protected provider requests also require an independently
+attested workload key proof before any subject-secret resolution.
+
+The built-in attestation and sandbox authorization adapters deny. Integrations
+must provide real verifiers and a claimant-bound device evidence channel; an
+owner's enrolled-device lookup alone is insufficient. Unsupported secret
+delivery and renewal paths reject while enabled. See the
+[implementation notes](../../docs/bootstrap-authz/02-implementation.md) for
+test coverage and production limitations.
+
 ## Shared supervisor pool
 
 The `SharedSupervision` the gateway hands a compute driver that asks for it

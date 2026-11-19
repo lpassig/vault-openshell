@@ -104,6 +104,7 @@ pub struct MintedToken {
 /// Issuer and verifier for launch-scoped supervisor credentials.
 pub struct SandboxSessionJwtAuthority {
     issuer: SessionJwtIssuer,
+    bootstrap_required: std::sync::atomic::AtomicBool,
     gateway_verifier: SessionJwtVerifier,
     supervisor_verifier: SupervisorJwtVerifier,
     gateway_id: String,
@@ -160,11 +161,17 @@ impl SandboxSessionJwtAuthority {
                 .map_err(|error| error.to_string())?;
         Ok(Self {
             issuer,
+            bootstrap_required: std::sync::atomic::AtomicBool::new(false),
             gateway_verifier,
             supervisor_verifier,
             gateway_id: gateway_id.to_string(),
             verification_keys,
         })
+    }
+
+    pub fn require_bootstrap_authorization(&self) {
+        self.bootstrap_required
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     #[allow(clippy::result_large_err)]
@@ -185,6 +192,7 @@ impl SandboxSessionJwtAuthority {
             identity.auth_epoch,
             identity.gateway_token_id,
             token_metadata,
+            identity.bootstrap.as_ref(),
         )
     }
 
@@ -202,6 +210,7 @@ impl SandboxSessionJwtAuthority {
             auth_epoch,
             gateway_token_id,
             None,
+            None,
         )
     }
 
@@ -213,7 +222,17 @@ impl SandboxSessionJwtAuthority {
         auth_epoch: CredentialEpoch,
         gateway_token_id: uuid::Uuid,
         token_metadata: Option<(uuid::Uuid, i64)>,
+        bootstrap: Option<&openshell_core::bootstrap_identity::Grant>,
     ) -> Result<SandboxLaunchAuthentication, Status> {
+        if self
+            .bootstrap_required
+            .load(std::sync::atomic::Ordering::Acquire)
+            && bootstrap.is_none()
+        {
+            return Err(Status::permission_denied(
+                "bootstrap admission required before minting",
+            ));
+        }
         // Derive the session from durable launch identity, not token IDs or
         // minting time. Retries and credential renewal retain this session;
         // a fresh generation gets a different one without new stored metadata.
@@ -234,20 +253,16 @@ impl SandboxSessionJwtAuthority {
             runtime_generation: runtime_generation.clone(),
             auth_epoch,
         };
-        let pair = token_metadata
-            .map_or_else(
-                || {
-                    self.issuer
-                        .mint_pair_with_gateway_token_id(&identity, gateway_token_id)
-                },
-                |(sandbox_token_id, issued_at)| {
-                    self.issuer.mint_pair_with_token_metadata(
-                        &identity,
-                        gateway_token_id,
-                        sandbox_token_id,
-                        issued_at,
-                    )
-                },
+        let (sandbox_token_id, issued_at) =
+            token_metadata.unwrap_or_else(|| (uuid::Uuid::new_v4(), now_secs()));
+        let pair = self
+            .issuer
+            .mint_pair_with_bootstrap(
+                &identity,
+                gateway_token_id,
+                sandbox_token_id,
+                issued_at,
+                bootstrap,
             )
             .map_err(|error| {
                 warn!(%error, "failed to mint launch-scoped sandbox credentials");
@@ -282,13 +297,25 @@ impl SandboxSessionJwtAuthority {
         &self,
         token: &str,
     ) -> Result<AuthenticatedSandboxSession, AuthRejection> {
-        self.gateway_verifier.verify(token).map_err(|error| {
+        let session = self.gateway_verifier.verify(token).map_err(|error| {
             AuthRejection::new(
                 AuthMechanism::SandboxJwt,
                 session_failure_reason(&error),
                 Status::unauthenticated(format!("invalid gateway session: {error}")),
             )
-        })
+        })?;
+        if self
+            .bootstrap_required
+            .load(std::sync::atomic::Ordering::Acquire)
+            && session.bootstrap.is_none()
+        {
+            return Err(AuthRejection::new(
+                AuthMechanism::SandboxJwt,
+                AuthFailureReason::InvalidCredential,
+                Status::permission_denied("bootstrap authorization grant required"),
+            ));
+        }
+        Ok(session)
     }
 
     /// Mint the shared supervisor's token for the assignment stream. Its
@@ -372,6 +399,13 @@ impl Authenticator for SandboxSessionJwtAuthenticator {
             return Ok(Authentication::NotApplicable);
         }
         let authenticated = self.authority.verify_gateway_token(token)?;
+        if authenticated.bootstrap.is_some() && !bootstrap_callable(path) {
+            return Err(AuthRejection::new(
+                AuthMechanism::SandboxJwt,
+                AuthFailureReason::InvalidCredential,
+                Status::permission_denied("bootstrap credential does not authorize this method"),
+            ));
+        }
         // Refresh performs its own lineage check so the immediately consumed
         // bearer can recover an already-committed successor after a lost
         // response. Every other RPC accepts only the current bearer.
@@ -389,6 +423,17 @@ impl Authenticator for SandboxSessionJwtAuthenticator {
             },
         )))
     }
+}
+
+fn bootstrap_callable(path: &str) -> bool {
+    matches!(
+        path,
+        "/openshell.v1.OpenShell/ConnectSupervisor"
+            | "/openshell.v1.OpenShell/GetSandboxConfig"
+            | "/openshell.v1.OpenShell/ReportSandboxConfiguration"
+            | "/openshell.v1.OpenShell/GetSandboxProviderAccessToken"
+            | "/openshell.v1.OpenShell/RefreshSandboxToken"
+    )
 }
 
 fn session_failure_reason(error: &SessionJwtError) -> AuthFailureReason {
@@ -584,6 +629,21 @@ mod tests {
     use super::*;
     use jsonwebtoken::{DecodingKey, Validation, decode};
     use openshell_bootstrap::jwt::generate_jwt_key;
+
+    #[test]
+    fn bootstrap_method_capabilities_do_not_export_or_relay_credentials() {
+        assert!(bootstrap_callable(
+            "/openshell.v1.OpenShell/GetSandboxProviderAccessToken"
+        ));
+        for path in [
+            "/openshell.v1.OpenShell/RelayStream",
+            "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
+            "/openshell.v1.OpenShell/ExchangeProviderSubjectToken",
+            "/openshell.v1.OpenShell/CreateProvider",
+        ] {
+            assert!(!bootstrap_callable(path));
+        }
+    }
 
     fn issuer(ttl: Duration) -> ExtensionJwtIssuer {
         let mat = generate_jwt_key().expect("jwt key");
