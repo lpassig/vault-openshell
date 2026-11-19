@@ -248,19 +248,7 @@ async fn obtain(
     let configured = grant_configuration(state, session.sandbox_id.as_str(), key).await?;
     let grant = &configured.grant;
     let permit = if let Some(gate) = &state.bootstrap_authorization {
-        let mut proofs = request
-            .metadata()
-            .get_all(crate::auth::bootstrap::PROOF_HEADER)
-            .iter();
-        let proof = proofs
-            .next()
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
-        if proofs.next().is_some() {
-            return Err(gate
-                .reject(session.sandbox_id.as_str(), "ambiguous_workload_proof")
-                .await);
-        }
+        let proof = crate::auth::bootstrap::workload_proof(request.metadata()).unwrap_or_default();
         let audience = effective_jwt_svid_audience(&grant.token_endpoint, &grant.jwt_svid_audience);
         let audit_denial = |_: &Status| {
             crate::auth::audit::emit_authorization_denial(

@@ -12,6 +12,8 @@ pub const WORKLOAD_PROOF_HEADER: &str = "x-openshell-workload-proof";
 pub const WORKLOAD_PROOF_TYPE: &str = "openshell-bootstrap-proof+jwt";
 pub const WORKLOAD_PROOF_ISSUER: &str = "openshell-workload-proof";
 pub const WORKLOAD_PROOF_TTL_SECS: i64 = 30;
+pub const RENEWAL_RESOURCE: &str = "/openshell.v1.OpenShell/RefreshSandboxToken";
+pub const RENEWAL_SVID_AUDIENCE: &str = "urn:openshell:bootstrap:session-renewal";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +33,10 @@ pub struct SandboxIntent {
 #[serde(deny_unknown_fields)]
 pub struct Grant {
     pub decision_id: String,
+    /// Original launch admission for a renewed session. Revocation of the
+    /// launch admission invalidates the entire renewed lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_decision_id: Option<String>,
     pub intent: SandboxIntent,
     pub device_id: String,
     pub device_revision: String,

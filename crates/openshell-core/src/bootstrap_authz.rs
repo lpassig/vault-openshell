@@ -29,6 +29,7 @@ pub enum Stage {
     Bootstrap,
     Provider,
     Activation,
+    Renewal,
 }
 
 /// Fixed, secret-free errors. Adapter and policy diagnostics must not escape.
@@ -57,8 +58,24 @@ pub enum Denial {
 
 pub use crate::bootstrap_identity::{Grant, ProofClaims, SandboxIntent};
 use crate::bootstrap_identity::{
-    WORKLOAD_PROOF_ISSUER, WORKLOAD_PROOF_TTL_SECS, WORKLOAD_PROOF_TYPE,
+    RENEWAL_RESOURCE, RENEWAL_SVID_AUDIENCE, WORKLOAD_PROOF_ISSUER, WORKLOAD_PROOF_TTL_SECS,
+    WORKLOAD_PROOF_TYPE,
 };
+
+#[derive(Clone, Copy)]
+pub enum WorkloadOperation<'a> {
+    Provider(&'a str),
+    Renew,
+}
+
+impl WorkloadOperation<'_> {
+    fn policy(&self) -> (Stage, &str, &'static str) {
+        match self {
+            Self::Provider(resource) => (Stage::Provider, resource, PROVIDER_CAPABILITY),
+            Self::Renew => (Stage::Renewal, RENEWAL_RESOURCE, BOOTSTRAP_CAPABILITY),
+        }
+    }
+}
 
 /// Challenge delivered only to a trusted attestation adapter.
 #[derive(Clone)]
@@ -409,6 +426,7 @@ impl BootstrapGate {
             let expires_at = validate_response(&request, &response, BOOTSTRAP_CAPABILITY)?;
             Ok(Grant {
                 decision_id: id.clone(),
+                launch_decision_id: None,
                 intent: intent.clone(),
                 device_id: device.device_id,
                 device_revision: device.device_revision,
@@ -439,16 +457,17 @@ impl BootstrapGate {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn provider(
+    pub async fn workload_permit(
         &self,
         grant: &Grant,
         intent: &SandboxIntent,
         workload: WorkloadEvidence<'_>,
         gateway_token_id: &str,
         raw_proof: &str,
-        resource: &str,
+        operation: WorkloadOperation<'_>,
         now: i64,
     ) -> Result<Grant, Denial> {
+        let (stage, resource, capability) = operation.policy();
         let id = fresh_id()?;
         let result = tokio::time::timeout(self.timeout, async {
             if grant.intent != *intent || grant.expires_at <= now || grant.issued_at > now {
@@ -468,11 +487,16 @@ impl BootstrapGate {
             {
                 return Err(Denial::IdentityMismatch);
             }
+            if stage == Stage::Renewal
+                && (intent.driver != "kubernetes" || workload.audience != RENEWAL_SVID_AUDIENCE)
+            {
+                return Err(Denial::IdentityMismatch);
+            }
             if raw_proof.is_empty() || raw_proof.len() > 16_384 {
                 return Err(Denial::InvalidProof);
             }
             let context = AttestationContext {
-                stage: Stage::Provider,
+                stage,
                 challenge: id.clone(),
                 now,
                 intent: intent.clone(),
@@ -496,6 +520,14 @@ impl BootstrapGate {
                 .as_deref()
                 .ok_or(Denial::MissingSignal)?;
             let proof_key_digest = digest(key)?;
+            if grant.launch_decision_id.is_some()
+                && (grant.host_id != device.host_id
+                    || grant.runtime_identity != device.runtime_identity
+                    || grant.selectors != device.selectors
+                    || grant.proof_key_digest.as_ref() != Some(&proof_key_digest))
+            {
+                return Err(Denial::IdentityMismatch);
+            }
             let proof = self
                 .proof
                 .verify(
@@ -510,10 +542,11 @@ impl BootstrapGate {
                     },
                 )
                 .await?;
+            let evidence_expires_at = device.expires_at.min(workload.expires_at).min(proof.exp);
             let request = DecisionRequest {
                 request_id: id.clone(),
                 parent_decision_id: Some(grant.decision_id.clone()),
-                stage: Stage::Provider,
+                stage,
                 intent: intent.clone(),
                 device_id: device.device_id.clone(),
                 device_revision: device.device_revision.clone(),
@@ -524,18 +557,25 @@ impl BootstrapGate {
                 selectors: device.selectors.clone(),
                 resource: resource.into(),
                 now,
-                expires_at: grant
-                    .expires_at
-                    .min(device.expires_at)
-                    .min(workload.expires_at)
-                    .min(proof.exp),
+                expires_at: if stage == Stage::Renewal {
+                    evidence_expires_at
+                } else {
+                    grant.expires_at.min(evidence_expires_at)
+                },
             };
             let response = self.authorizer.decide(&request).await?;
-            let expires_at = validate_response(&request, &response, PROVIDER_CAPABILITY)?;
+            let expires_at = validate_response(&request, &response, capability)?;
             let replay_key = digest(format!("{}:{}", grant.decision_id, proof.jti).as_bytes())?;
             self.store.consume_proof(&replay_key, proof.exp).await?;
             Ok(Grant {
                 decision_id: id.clone(),
+                launch_decision_id: (stage == Stage::Renewal).then(|| {
+                    grant
+                        .launch_decision_id
+                        .as_ref()
+                        .unwrap_or(&grant.decision_id)
+                        .clone()
+                }),
                 intent: intent.clone(),
                 device_id: device.device_id,
                 device_revision: device.device_revision,
@@ -543,7 +583,11 @@ impl BootstrapGate {
                 runtime_identity: Some(workload.runtime_identity.into()),
                 proof_key_digest: Some(proof_key_digest),
                 selectors: device.selectors,
-                challenge: String::new(),
+                challenge: if stage == Stage::Renewal {
+                    fresh_id()?
+                } else {
+                    String::new()
+                },
                 issued_at: now,
                 expires_at,
                 scopes: response.scopes,
@@ -554,7 +598,7 @@ impl BootstrapGate {
         self.audit(
             &id,
             Some(&grant.decision_id),
-            Stage::Provider,
+            stage,
             intent,
             result.as_ref().ok(),
             &result.as_ref().map(|_| ()),
@@ -634,6 +678,7 @@ impl BootstrapGate {
             let expires_at = validate_response(&request, &response, ACTIVATION_CAPABILITY)?;
             Ok(Grant {
                 decision_id: id.clone(),
+                launch_decision_id: None,
                 intent: intent.clone(),
                 device_id: device.device_id,
                 device_revision: device.device_revision,
@@ -670,13 +715,18 @@ impl BootstrapGate {
         intent: &SandboxIntent,
         now: i64,
     ) -> Result<(), Denial> {
+        let stage = if permit.launch_decision_id.is_some() {
+            Stage::Renewal
+        } else {
+            Stage::Provider
+        };
         tokio::time::timeout(self.timeout, async {
             if permit.intent != *intent || permit.expires_at <= now {
                 return Err(Denial::StaleEvidence);
             }
             self.sandbox_authorization.verify(intent, now).await?;
             let context = AttestationContext {
-                stage: Stage::Provider,
+                stage,
                 challenge: fresh_id()?,
                 now,
                 intent: intent.clone(),

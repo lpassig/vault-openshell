@@ -328,7 +328,6 @@ async fn load_identity(
     })?;
     if principal.runtime_generation != identity.runtime_generation
         || principal.auth_epoch != identity.auth_epoch
-        || principal.bootstrap != identity.bootstrap
     {
         return Err(stale_identity());
     }
@@ -341,7 +340,9 @@ pub async fn authorize_persisted(
     principal: &AuthenticatedSandboxSession,
 ) -> Result<PersistedSandboxIdentity, AuthRejection> {
     let (_, identity) = load_identity(store, principal).await?;
-    if principal.token_id != identity.gateway_token_id {
+    if (principal.token_id, &principal.bootstrap)
+        != (identity.gateway_token_id, &identity.bootstrap)
+    {
         return Err(stale_identity());
     }
     Ok(identity)
@@ -362,6 +363,9 @@ pub async fn authorize_refresh(
 ) -> Result<RefreshAuthorization, AuthRejection> {
     let (_, identity) = load_identity(store, principal).await?;
     if principal.token_id == identity.gateway_token_id {
+        if principal.bootstrap != identity.bootstrap {
+            return Err(stale_identity());
+        }
         return Ok(RefreshAuthorization::Current(identity));
     }
     let Some(replay) = &identity.refresh_replay else {
@@ -370,6 +374,19 @@ pub async fn authorize_refresh(
     if principal.token_id != replay.previous_gateway_token_id
         || request_hash != &replay.request_hash
         || now > replay.replay_until
+        || !match (&principal.bootstrap, &identity.bootstrap) {
+            (None, None) => true,
+            (Some(previous), Some(current)) => {
+                current.launch_decision_id.as_ref()
+                    == Some(
+                        previous
+                            .launch_decision_id
+                            .as_ref()
+                            .unwrap_or(&previous.decision_id),
+                    )
+            }
+            _ => false,
+        }
     {
         return Err(reject(
             AuthFailureReason::StaleIdentity,
@@ -389,13 +406,15 @@ pub async fn rotate_gateway_token(
     store: &Store,
     principal: &AuthenticatedSandboxSession,
     next: &PersistedSandboxIdentity,
+    expected_revision: Option<u64>,
 ) -> Result<PersistedSandboxIdentity, Status> {
     // `authorize_refresh` already audited this bearer; a rejection here means
     // the sandbox changed during the refresh.
     let (sandbox, current) = load_identity(store, principal)
         .await
         .map_err(|rejection| rejection.status)?;
-    if principal.token_id != current.gateway_token_id {
+    if (principal.token_id, &principal.bootstrap) != (current.gateway_token_id, &current.bootstrap)
+    {
         return Err(Status::unauthenticated(
             "gateway token does not match the active sandbox identity",
         ));
@@ -410,6 +429,11 @@ pub async fn rotate_gateway_token(
         .metadata
         .as_ref()
         .ok_or_else(|| Status::unauthenticated("sandbox identity metadata is missing"))?;
+    if expected_revision.is_some_and(|revision| revision != metadata.resource_version) {
+        return Err(Status::aborted(
+            "sandbox changed after renewal authorization",
+        ));
+    }
     store
         .update_message_cas::<Sandbox, _>(
             principal.sandbox_id.as_str(),
@@ -705,7 +729,7 @@ mod tests {
             .expect("current identity")
             .next_gateway_token(request_hash.clone(), 100, 30)
             .unwrap();
-        let next = rotate_gateway_token(&store, &first, &expected)
+        let next = rotate_gateway_token(&store, &first, &expected, None)
             .await
             .expect("rotate current gateway token");
         assert_ne!(next.gateway_token_id, first.token_id);

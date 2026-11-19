@@ -1436,6 +1436,9 @@ mod session {
             || grant.intent.auth_epoch != identity.auth_epoch.get()
             || grant.device_id.is_empty()
             || Uuid::parse_str(&grant.decision_id).is_err()
+            || grant.launch_decision_id.as_ref().is_some_and(|launch| {
+                launch == &grant.decision_id || Uuid::parse_str(launch).is_err()
+            })
             || Uuid::parse_str(&grant.challenge).is_err()
             || grant.scopes != std::collections::BTreeSet::from(["bootstrap".to_string()])
             || grant.issued_at <= 0
@@ -1634,6 +1637,7 @@ mod tests {
                     .is_none()
             );
             let grant = crate::bootstrap_identity::Grant {
+                launch_decision_id: None,
                 decision_id: uuid::Uuid::new_v4().to_string(),
                 intent: crate::bootstrap_identity::SandboxIntent {
                     gateway_id: "test".into(),

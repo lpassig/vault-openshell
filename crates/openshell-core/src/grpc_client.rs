@@ -225,12 +225,28 @@ impl GatewayCredentials {
         if !matches!(*renewal, Renewal::Idle) {
             return;
         }
+        let channel = channel.clone();
+        #[cfg(feature = "jwt")]
+        let signed_renewal = self.workload_proof_signer.is_some();
+        #[cfg(not(feature = "jwt"))]
+        let signed_renewal = false;
+        #[cfg(feature = "jwt")]
+        let channel = if signed_renewal {
+            if !endpoint.starts_with("https://") {
+                warn!("workload proof renewal requires a verified HTTPS gateway endpoint");
+                return;
+            }
+            InterceptedService::new(plain_channel.clone(), AuthInterceptor::for_workload(self))
+        } else {
+            channel
+        };
         let task = tokio::spawn(refresh_token_loop(RenewalTarget {
-            channel: channel.clone(),
+            channel,
             bearer: self.inner.bearer.clone(),
             #[cfg(feature = "jwt")]
             sandbox_bearer: self.inner.sandbox_bearer.clone(),
             source: self.inner.source,
+            signed_renewal,
             endpoint: endpoint.to_string(),
             plain_channel: plain_channel.clone(),
         }));
@@ -363,7 +379,7 @@ pub struct AuthInterceptor {
 #[cfg(feature = "jwt")]
 #[derive(Clone)]
 struct WorkloadProofTarget {
-    key: String,
+    resource: String,
     svid_audience: String,
 }
 
@@ -376,7 +392,7 @@ impl AuthInterceptor {
         }
     }
 
-    fn for_provider(credentials: &GatewayCredentials) -> Self {
+    fn for_workload(credentials: &GatewayCredentials) -> Self {
         Self {
             bearer: credentials.inner.bearer.clone(),
             #[cfg(feature = "jwt")]
@@ -403,21 +419,17 @@ impl tonic::service::Interceptor for AuthInterceptor {
             let target = req
                 .extensions_mut()
                 .remove::<WorkloadProofTarget>()
-                .ok_or_else(|| {
-                    Status::permission_denied("missing provider workload proof target")
-                })?;
+                .ok_or_else(|| Status::permission_denied("missing workload proof target"))?;
             let token = bearer
                 .to_str()
                 .ok()
                 .and_then(crate::auth::strip_bearer_scheme)
-                .ok_or_else(|| Status::unauthenticated("invalid provider gateway bearer"))?;
+                .ok_or_else(|| Status::unauthenticated("invalid workload gateway bearer"))?;
             let proof = signer
-                .sign(token, &target.key, &target.svid_audience)
-                .map_err(|_| {
-                    Status::permission_denied("cannot sign the provider workload proof")
-                })?;
+                .sign(token, &target.resource, &target.svid_audience)
+                .map_err(|_| Status::permission_denied("cannot sign the workload proof"))?;
             let mut metadata = AsciiMetadataValue::try_from(proof)
-                .map_err(|_| Status::permission_denied("invalid provider workload proof"))?;
+                .map_err(|_| Status::permission_denied("invalid workload proof"))?;
             metadata.set_sensitive(true);
             req.metadata_mut()
                 .insert(crate::bootstrap_identity::WORKLOAD_PROOF_HEADER, metadata);
@@ -818,6 +830,7 @@ struct RenewalTarget {
     #[cfg(feature = "jwt")]
     sandbox_bearer: Option<crate::jwt::SessionBearerTokenSlot>,
     source: TokenSource,
+    signed_renewal: bool,
     endpoint: String,
     plain_channel: Channel,
 }
@@ -834,23 +847,46 @@ async fn refresh_token_loop(target: RenewalTarget) {
         #[cfg(feature = "jwt")]
         sandbox_bearer,
         source,
+        signed_renewal,
         endpoint,
         plain_channel,
     } = target;
     let mut client = OpenShellClient::new(channel);
+    let mut retrying = false;
     loop {
-        let Some(sleep) = compute_refresh_delay(&slot) else {
-            debug!("gateway sandbox JWT does not expire; stopping periodic renewal");
+        let Some(sleep) = compute_refresh_delay(&slot, signed_renewal) else {
+            debug!("gateway sandbox JWT has no scheduled renewal");
             return;
         };
-        tokio::time::sleep(sleep).await;
-        match client
-            .refresh_sandbox_token(RefreshSandboxTokenRequest {
-                extension_service_names: Vec::new(),
-            })
-            .await
-        {
+        if !retrying {
+            tokio::time::sleep(if signed_renewal { sleep / 2 } else { sleep }).await;
+        }
+        let request = tonic::Request::new(RefreshSandboxTokenRequest {
+            extension_service_names: Vec::new(),
+        });
+        #[cfg(feature = "jwt")]
+        let request = if signed_renewal {
+            let mut request = request;
+            request.set_timeout(Duration::from_secs(5));
+            request.extensions_mut().insert(WorkloadProofTarget {
+                resource: crate::bootstrap_identity::RENEWAL_RESOURCE.into(),
+                svid_audience: crate::bootstrap_identity::RENEWAL_SVID_AUDIENCE.into(),
+            });
+            request
+        } else {
+            request
+        };
+        let refresh = client.refresh_sandbox_token(request);
+        let response = if signed_renewal {
+            tokio::time::timeout(Duration::from_secs(5), refresh)
+                .await
+                .unwrap_or_else(|_| Err(Status::deadline_exceeded("session renewal timed out")))
+        } else {
+            refresh.await
+        };
+        match response {
             Ok(resp) => {
+                retrying = false;
                 let response = resp.into_inner();
                 #[cfg(feature = "jwt")]
                 let sandbox_refresh = match validate_sandbox_refresh(&response) {
@@ -891,6 +927,14 @@ async fn refresh_token_loop(target: RenewalTarget) {
                 info!("renewed gateway and Sandbox Protocol credentials in-place");
             }
             Err(status) => {
+                if signed_renewal {
+                    // A committed rotation with a lost response can be recovered
+                    // only while the previous token is still valid.
+                    retrying = true;
+                    warn!(error = %status, "proof-bound RefreshSandboxToken failed; will retry");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
                 if status.code() == tonic::Code::Unauthenticated
                     && source == TokenSource::K8sServiceAccount
                 {
@@ -1060,7 +1104,7 @@ async fn refresh_extension_credentials_with_client(
 /// for already-expired tokens and capped at 12 h. An `exp` of zero denotes a
 /// non-expiring session credential and needs no periodic refresh. If the token
 /// can't be parsed (for example, an opaque bootstrap bearer), default to 6 h.
-fn compute_refresh_delay(slot: &TokenSlot) -> Option<Duration> {
+fn compute_refresh_delay(slot: &TokenSlot, stop_at_expiry: bool) -> Option<Duration> {
     let token = {
         let current = slot
             .read()
@@ -1076,7 +1120,7 @@ fn compute_refresh_delay(slot: &TokenSlot) -> Option<Duration> {
     )
     .unwrap_or(i64::MAX);
     let expires_at = parse_jwt_exp_ms(&token);
-    if expires_at == Some(0) {
+    if expires_at == Some(0) || (stop_at_expiry && expires_at.is_some_and(|exp| exp <= now_ms)) {
         return None;
     }
     let mut delay_ms = expires_at.map_or(21_600_000, |exp| {
@@ -1205,7 +1249,7 @@ mod auth_tests {
         let token = format!("h.{payload}.s");
         let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}")).unwrap();
         let slot: TokenSlot = Arc::new(RwLock::new(Some(bearer)));
-        let delay = compute_refresh_delay(&slot).expect("expiring token needs refresh");
+        let delay = compute_refresh_delay(&slot, false).expect("expiring token needs refresh");
         // 800 s baseline + up to 10 % jitter → 800..=880 s, with some slack
         // for the 1-second resolution of the exp claim.
         let secs = delay.as_secs();
@@ -1226,8 +1270,9 @@ mod auth_tests {
         let token = format!("h.{payload}.s");
         let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}")).unwrap();
         let slot: TokenSlot = Arc::new(RwLock::new(Some(bearer)));
-        let delay = compute_refresh_delay(&slot).expect("expired token needs refresh");
+        let delay = compute_refresh_delay(&slot, false).expect("expired token needs refresh");
         assert!((1..60).contains(&delay.as_secs()));
+        assert_eq!(compute_refresh_delay(&slot, true), None);
     }
 
     #[test]
@@ -1237,7 +1282,7 @@ mod auth_tests {
         let token = format!("h.{payload}.s");
         let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}")).unwrap();
         let slot: TokenSlot = Arc::new(RwLock::new(Some(bearer)));
-        assert_eq!(compute_refresh_delay(&slot), None);
+        assert_eq!(compute_refresh_delay(&slot, false), None);
     }
 
     #[test]
@@ -1253,7 +1298,7 @@ mod auth_tests {
         let token = format!("h.{payload}.s");
         let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}")).unwrap();
         let slot: TokenSlot = Arc::new(RwLock::new(Some(bearer)));
-        let delay = compute_refresh_delay(&slot).expect("expiring token needs refresh");
+        let delay = compute_refresh_delay(&slot, false).expect("expiring token needs refresh");
         assert!(
             delay.as_secs() < 30,
             "expected refresh before 30s expiry, got {delay:?}",
@@ -1897,7 +1942,7 @@ impl SandboxProviderTokenClient {
                 return Err(gateway_grant_failure(TokenGrantFailureKind::Configuration));
             }
             let target = WorkloadProofTarget {
-                key: request.get_ref().credential_key.clone(),
+                resource: request.get_ref().credential_key.clone(),
                 svid_audience: svid_audience.into(),
             };
             request.extensions_mut().insert(target);
@@ -1916,7 +1961,7 @@ impl SandboxProviderTokenClient {
                         .start_renewal(&renewal, &channel, gateway.url());
                     Ok::<_, miette::Report>(OpenShellClient::new(InterceptedService::new(
                         channel,
-                        AuthInterceptor::for_provider(gateway.credentials()),
+                        AuthInterceptor::for_workload(gateway.credentials()),
                     )))
                 })
                 .await

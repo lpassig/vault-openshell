@@ -13,11 +13,12 @@ use miette::{Result, miette};
 use serde::Deserialize;
 
 use crate::bootstrap_identity::{
-    ProofClaims, WORKLOAD_PROOF_ISSUER, WORKLOAD_PROOF_TTL_SECS, WORKLOAD_PROOF_TYPE,
+    ProofClaims, RENEWAL_RESOURCE, RENEWAL_SVID_AUDIENCE, WORKLOAD_PROOF_ISSUER,
+    WORKLOAD_PROOF_TTL_SECS, WORKLOAD_PROOF_TYPE,
 };
 use crate::jwt::{
-    CredentialEpoch, JwtClock, SecretJwt, SecretPrivateKeyPem, SessionJwtVerifier,
-    SessionTokenProfile, SessionVerificationKey, SupervisorAuthBundle, SystemJwtClock,
+    CredentialEpoch, JwtClock, SecretPrivateKeyPem, SessionJwtVerifier, SessionTokenProfile,
+    SessionVerificationKey, SupervisorAuthBundle, SystemJwtClock,
 };
 use crate::sandbox_generation::SandboxGenerationId;
 
@@ -39,7 +40,6 @@ pub struct BootstrapProofSigner {
     sandbox_id: String,
     generation: SandboxGenerationId,
     auth_epoch: CredentialEpoch,
-    gateway_token: SecretJwt,
 }
 
 impl BootstrapProofSigner {
@@ -63,15 +63,11 @@ impl BootstrapProofSigner {
             sandbox_id: sandbox_id.into(),
             generation,
             auth_epoch,
-            gateway_token: bundle.gateway_token.clone(),
         })
     }
 
     pub fn sign(&self, bearer: &str, resource: &str, svid_audience: &str) -> Result<String> {
-        if bearer != self.gateway_token.expose_secret()
-            || resource.is_empty()
-            || svid_audience.is_empty()
-        {
+        if resource.is_empty() || svid_audience.is_empty() {
             return Err(miette!(
                 "workload proof does not match the current assignment"
             ));
@@ -88,7 +84,7 @@ impl BootstrapProofSigner {
         .map_err(|_| miette!("invalid gateway verification keys for workload proof"))?;
         let session = verifier
             .verify(bearer)
-            .map_err(|_| miette!("invalid gateway launch token for workload proof"))?;
+            .map_err(|_| miette!("invalid gateway session token for workload proof"))?;
         let grant = session
             .bootstrap
             .as_ref()
@@ -108,13 +104,19 @@ impl BootstrapProofSigner {
             EncodingKey::from_ed_pem(enrolled.private_key_pem.expose_secret().as_bytes())
                 .map_err(|_| miette!("invalid Ed25519 workload key"))?;
         let now = SystemJwtClock.now_unix_seconds();
-        let exp = session
-            .expires_at
-            .min(grant.expires_at)
-            .min(now.saturating_add(WORKLOAD_PROOF_TTL_SECS));
-        if exp <= now {
+        let current_expiration = session.expires_at.min(grant.expires_at);
+        if current_expiration <= now {
             return Err(miette!("bootstrap grant expired"));
         }
+        let proof_expiration = now.saturating_add(WORKLOAD_PROOF_TTL_SECS);
+        // The gateway checks that the old bearer is still live at renewal.
+        // Its expiry caps use of this proof, while the new decision gets a
+        // fresh deadline bounded by the proof and renewed evidence.
+        let exp = if resource == RENEWAL_RESOURCE && svid_audience == RENEWAL_SVID_AUDIENCE {
+            proof_expiration
+        } else {
+            proof_expiration.min(current_expiration)
+        };
         let nonce = openshell_crypto::random_bytes::<16>()
             .map_err(|_| miette!("cannot generate a workload proof nonce"))?;
         let claims = ProofClaims {

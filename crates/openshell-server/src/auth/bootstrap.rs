@@ -13,6 +13,7 @@ use openshell_core::bootstrap_authz::{
     AuditRecord, BootstrapGate, DecisionStore, Denial, DeviceAttestationAdapter, Grant,
     JwtWorkloadProofVerifier, RegoAuthorizer, SandboxAuthorizationAdapter, SandboxIntent, Stage,
     UnavailableDeviceAttestation, UnavailableSandboxAuthorization, WorkloadEvidence,
+    WorkloadOperation,
 };
 use openshell_core::config::Config;
 use openshell_core::jwt::AuthenticatedSandboxSession;
@@ -35,6 +36,12 @@ const GRANT_TYPE: &str = "bootstrap_authorization_grant";
 const PROOF_TYPE: &str = "bootstrap_authorization_proof";
 pub use openshell_core::bootstrap_identity::WORKLOAD_PROOF_HEADER as PROOF_HEADER;
 pub const ACTIVATION_ANNOTATION: &str = "internal.openshell.ai/bootstrap-activation";
+
+pub fn workload_proof(metadata: &tonic::metadata::MetadataMap) -> Option<&str> {
+    let mut values = metadata.get_all(PROOF_HEADER).iter();
+    let proof = values.next()?.to_str().ok()?;
+    values.next().is_none().then_some(proof)
+}
 
 #[derive(Serialize)]
 struct ConfigurationActivation<'a> {
@@ -252,6 +259,11 @@ impl BootstrapRuntime {
             .bootstrap(intent, device_evidence, now())
             .await
             .map_err(status)?;
+        self.persist_grant(&grant).await?;
+        Ok(grant)
+    }
+
+    pub(crate) async fn persist_grant(&self, grant: &Grant) -> Result<(), Status> {
         let payload =
             serde_json::to_vec(&grant).map_err(|_| status(Denial::ReplayOrPersistence))?;
         self.store
@@ -259,14 +271,14 @@ impl BootstrapRuntime {
                 GRANT_TYPE,
                 &format!("bootstrap-grant:{}", grant.decision_id),
                 &grant.decision_id,
-                sandbox.object_workspace(),
+                &grant.intent.workspace,
                 &payload,
                 None,
                 WriteCondition::MustCreate,
             )
             .await
             .map_err(|_| status(Denial::ReplayOrPersistence))?;
-        Ok(grant)
+        Ok(())
     }
 
     pub fn require_credential_free(sandbox: &Sandbox) -> Result<(), Status> {
@@ -511,6 +523,43 @@ impl BootstrapRuntime {
         audience: &str,
         configuration: (&Provider, &ProviderCredentialTokenGrant),
     ) -> Result<Grant, Status> {
+        self.workload_permit(
+            state,
+            session,
+            raw_proof,
+            audience,
+            WorkloadOperation::Provider(resource),
+            Some((configuration.0, resource, configuration.1)),
+        )
+        .await
+    }
+
+    pub(crate) async fn renewal_permit(
+        &self,
+        state: &ServerState,
+        session: &AuthenticatedSandboxSession,
+        raw_proof: &str,
+    ) -> Result<Grant, Status> {
+        self.workload_permit(
+            state,
+            session,
+            raw_proof,
+            openshell_core::bootstrap_identity::RENEWAL_SVID_AUDIENCE,
+            WorkloadOperation::Renew,
+            None,
+        )
+        .await
+    }
+
+    async fn workload_permit(
+        &self,
+        state: &ServerState,
+        session: &AuthenticatedSandboxSession,
+        raw_proof: &str,
+        audience: &str,
+        operation: WorkloadOperation<'_>,
+        configuration: Option<(&Provider, &str, &ProviderCredentialTokenGrant)>,
+    ) -> Result<Grant, Status> {
         let grant = session
             .bootstrap
             .as_ref()
@@ -529,7 +578,7 @@ impl BootstrapRuntime {
                 &grant.intent.owner,
                 session.runtime_generation.as_str(),
                 session.auth_epoch.get(),
-                Some((configuration.0, resource, configuration.1)),
+                configuration,
             )
             .await?;
         let runtime = sandbox
@@ -556,7 +605,7 @@ impl BootstrapRuntime {
         .map_err(|_| status(Denial::Timeout))?
         .map_err(|_| status(Denial::IdentityMismatch))?;
         self.gate
-            .provider(
+            .workload_permit(
                 grant,
                 &intent,
                 WorkloadEvidence {
@@ -567,7 +616,7 @@ impl BootstrapRuntime {
                 },
                 &session.token_id.to_string(),
                 raw_proof,
-                resource,
+                operation,
                 now(),
             )
             .await
@@ -580,23 +629,41 @@ impl BootstrapRuntime {
         session: &AuthenticatedSandboxSession,
         permit: &Grant,
     ) -> Result<(), Status> {
+        super::sandbox_session::authorize_persisted(&state.store, session)
+            .await
+            .map_err(|e| e.status)?;
+        self.recheck_evidence(state, session, permit)
+            .await
+            .map(drop)
+    }
+
+    /// Refresh checks lineage separately to permit proof-verified recovery
+    /// of a committed successor after a response is lost.
+    pub(crate) async fn recheck_evidence(
+        &self,
+        state: &ServerState,
+        session: &AuthenticatedSandboxSession,
+        permit: &Grant,
+    ) -> Result<u64, Status> {
+        if session.expires_at <= now() {
+            return Err(status(Denial::StaleEvidence));
+        }
         let grant = session
             .bootstrap
             .as_ref()
             .ok_or_else(|| status(Denial::MissingSignal))?;
         self.verify_grant(grant).await?;
-        super::sandbox_session::authorize_persisted(&state.store, session)
-            .await
-            .map_err(|e| e.status)?;
         let sandbox = state
             .store
             .get_message::<Sandbox>(session.sandbox_id.as_str())
             .await
             .map_err(|_| status(Denial::Unavailable))?
             .ok_or_else(|| status(Denial::MissingSignal))?;
-        let runtime = sandbox.metadata.as_ref().and_then(|metadata| {
-            super::compute_driver::recorded_runtime(metadata, &grant.intent.driver)
-        });
+        let metadata = sandbox
+            .metadata
+            .as_ref()
+            .ok_or_else(|| status(Denial::MissingSignal))?;
+        let runtime = super::compute_driver::recorded_runtime(metadata, &grant.intent.driver);
         if runtime.is_none() || runtime != permit.runtime_identity.as_deref() {
             return Err(status(Denial::IdentityMismatch));
         }
@@ -613,7 +680,19 @@ impl BootstrapRuntime {
         self.gate
             .recheck(permit, &intent, now())
             .await
-            .map_err(status)
+            .map_err(status)?;
+        if session.expires_at <= now() {
+            return Err(status(Denial::StaleEvidence));
+        }
+        Self::verify_permit_deadline(permit)?;
+        Ok(metadata.resource_version)
+    }
+
+    pub(crate) fn verify_permit_deadline(permit: &Grant) -> Result<(), Status> {
+        if permit.expires_at <= now() {
+            return Err(status(Denial::StaleEvidence));
+        }
+        Ok(())
     }
 
     /// Until a path can authenticate caller key possession, it has no credential capability.
@@ -659,20 +738,31 @@ impl BootstrapRuntime {
 
 /// Check the gateway-owned decision independently of the sandbox record and JWT.
 pub async fn verify_persisted_grant(store: &Store, grant: &Grant) -> Result<(), Status> {
-    let record = store
-        .get(
-            GRANT_TYPE,
-            &format!("bootstrap-grant:{}", grant.decision_id),
-        )
-        .await
-        .map_err(|_| status(Denial::ReplayOrPersistence))?
-        .ok_or_else(|| status(Denial::MissingSignal))?;
-    let persisted: Grant =
-        serde_json::from_slice(&record.payload).map_err(|_| status(Denial::ReplayOrPersistence))?;
+    let persisted = load_grant(store, &grant.decision_id).await?;
     if &persisted != grant || grant.expires_at <= now() {
         return Err(status(Denial::StaleEvidence));
     }
+    if let Some(id) = &grant.launch_decision_id {
+        let launch = load_grant(store, id).await?;
+        if launch.launch_decision_id.is_some()
+            || launch.decision_id != *id
+            || launch.intent != grant.intent
+            || launch.device_id != grant.device_id
+            || launch.device_revision != grant.device_revision
+        {
+            return Err(status(Denial::IdentityMismatch));
+        }
+    }
     Ok(())
+}
+
+async fn load_grant(store: &Store, id: &str) -> Result<Grant, Status> {
+    let record = store
+        .get(GRANT_TYPE, &format!("bootstrap-grant:{id}"))
+        .await
+        .map_err(|_| status(Denial::ReplayOrPersistence))?
+        .ok_or_else(|| status(Denial::MissingSignal))?;
+    serde_json::from_slice(&record.payload).map_err(|_| status(Denial::ReplayOrPersistence))
 }
 
 fn load_client_roots(path: &std::path::Path) -> Result<rustls::RootCertStore, String> {

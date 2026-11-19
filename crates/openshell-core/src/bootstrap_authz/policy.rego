@@ -43,3 +43,17 @@ decision := {"allow": true, "reason": "configuration_admitted", "ttl_secs": 30, 
     input.resource != ""
     input.expires_at > input.now
 }
+
+decision := {"allow": true, "reason": "renewal_admitted", "ttl_secs": 30, "scopes": ["bootstrap"]} if {
+    input.stage == "renewal"
+    input.intent.driver == "kubernetes"
+    input.parent_decision_id != ""
+    input.proof_verified
+    count(input.selectors) > 0
+    input.host_id != ""
+    input.host_id != null
+    input.runtime_identity != ""
+    input.spiffe_id == input.intent.expected_spiffe_id
+    input.resource == "/openshell.v1.OpenShell/RefreshSandboxToken"
+    input.expires_at > input.now
+}

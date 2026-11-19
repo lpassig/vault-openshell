@@ -213,6 +213,7 @@ impl SandboxIdentityProvider for MockBrokerAdapter {
 struct MockDevice {
     public_key: Vec<u8>,
     revoked: Arc<AtomicBool>,
+    launch_ttl: i64,
 }
 #[async_trait]
 impl DeviceAttestationAdapter for MockDevice {
@@ -228,7 +229,12 @@ impl DeviceAttestationAdapter for MockDevice {
             challenge: context.challenge.clone(),
             compliant: true,
             issued_at: context.now,
-            expires_at: context.now + 120,
+            expires_at: context.now
+                + if context.stage == Stage::Bootstrap {
+                    self.launch_ttl
+                } else {
+                    120
+                },
             device_revision: "enrolled-v1".into(),
             selectors: BTreeSet::from(["test:verified-selector".into()]),
             workload_key_pem: Some(self.public_key.clone()),
@@ -251,7 +257,7 @@ impl BootstrapAuthorizer for AllowPolicy {
             reason: "fixture_allowed".into(),
             ttl_secs: 60,
             scopes: BTreeSet::from([match req.stage {
-                Stage::Bootstrap => BOOTSTRAP_CAPABILITY,
+                Stage::Bootstrap | Stage::Renewal => BOOTSTRAP_CAPABILITY,
                 Stage::Activation => ACTIVATION_CAPABILITY,
                 Stage::Provider => PROVIDER_CAPABILITY,
             }
@@ -329,6 +335,7 @@ async fn assert_docker_configuration_admission(directory: &std::path::Path) {
         device: Arc::new(MockDevice {
             public_key: Vec::new(),
             revoked: revoked.clone(),
+            launch_ttl: 120,
         }),
         sandbox_authorization: Arc::new(MockSandboxAuthorization),
         proof: Arc::new(JwtWorkloadProofVerifier),
@@ -632,6 +639,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_launch_ttl(120).await
+    }
+
+    async fn with_launch_ttl(launch_ttl: i64) -> Self {
         let directory = tempfile::Builder::new()
             .prefix("bootstrap-test-")
             .tempdir_in("/tmp")
@@ -709,6 +720,16 @@ impl Fixture {
             jwks,
         }));
         let material = openshell_bootstrap::jwt::generate_jwt_key().unwrap();
+        state_mut.extension_jwt_issuer = Some(Arc::new(
+            crate::auth::sandbox_jwt::ExtensionJwtIssuer::from_pem(
+                material.signing_key_pem.as_bytes(),
+                material.public_key_pem.as_bytes(),
+                material.kid.clone(),
+                "gateway-a",
+                Duration::from_mins(1),
+            )
+            .unwrap(),
+        ));
         let authority = Arc::new(
             crate::auth::sandbox_jwt::SandboxSessionJwtAuthority::from_pem(
                 material.signing_key_pem.as_bytes(),
@@ -732,6 +753,7 @@ impl Fixture {
             device: Arc::new(MockDevice {
                 public_key: workload_key.public_key_pem().into_bytes(),
                 revoked: revoked.clone(),
+                launch_ttl,
             }),
             sandbox_authorization: Arc::new(MockSandboxAuthorization),
             proof: Arc::new(JwtWorkloadProofVerifier),
@@ -1004,7 +1026,7 @@ async fn bootstrap_provider_client_uses_the_enrolled_assignment_key() {
         )
         .remove(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME)
         .run_async(async {
-            let fixture = Fixture::new().await;
+            let fixture = Fixture::with_launch_ttl(10).await;
             crate::tls_test_utils::generate_test_certs_with_ca(directory.path());
             let acceptor = crate::TlsAcceptor::from_files(
                 &directory.path().join("server-cert.pem"),
@@ -1062,6 +1084,24 @@ async fn bootstrap_provider_client_uses_the_enrolled_assignment_key() {
             .unwrap();
             let token = request().await.unwrap();
             assert_eq!(token.access_token, "fixture-upstream-token");
+            let sandbox_slot = credentials.sandbox_bearer().unwrap();
+            let launch_expiration = fixture.supervisor_auth.sandbox_expires_at;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while sandbox_slot.expires_at().unwrap() <= launch_expiration {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("shared credentials should rotate using a signed workload proof");
+            let launch_remaining = launch_expiration.saturating_sub(crate::auth::bootstrap::now());
+            tokio::time::sleep(Duration::from_secs(
+                launch_remaining.try_into().unwrap_or(0),
+            ))
+            .await;
+            assert_eq!(
+                request().await.unwrap().access_token,
+                "fixture-upstream-token"
+            );
             let reads = fixture.vault_reads().await;
             assert!(reads > 0);
             credentials.revoke();
@@ -1069,6 +1109,102 @@ async fn bootstrap_provider_client_uses_the_enrolled_assignment_key() {
             assert_eq!(fixture.vault_reads().await, reads);
         })
         .await;
+}
+
+#[tokio::test]
+async fn bootstrap_renewal_requires_fresh_proofs_and_respects_launch_revocation() {
+    use crate::auth::authenticator::{Authentication, Authenticator};
+    use crate::auth::sandbox_jwt::SandboxSessionJwtAuthenticator;
+    use crate::grpc::auth_rpc::handle_refresh_sandbox_token;
+    use openshell_core::bootstrap_identity::{RENEWAL_RESOURCE, RENEWAL_SVID_AUDIENCE};
+    use openshell_core::proto::RefreshSandboxTokenRequest;
+
+    let fixture = Fixture::new().await;
+    let sign = |bearer: &str| {
+        fixture
+            .proof_signer
+            .sign(bearer, RENEWAL_RESOURCE, RENEWAL_SVID_AUDIENCE)
+            .unwrap()
+    };
+    let refresh = |bearer: &str, proof: Option<&str>, extension_names: Vec<String>| {
+        let mut request = fixture.request(None).map(|_| RefreshSandboxTokenRequest {
+            extension_service_names: extension_names,
+        });
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {bearer}").parse().unwrap());
+        if let Some(proof) = proof {
+            request
+                .metadata_mut()
+                .insert(crate::auth::bootstrap::PROOF_HEADER, proof.parse().unwrap());
+        }
+        handle_refresh_sandbox_token(&fixture.state, request)
+    };
+
+    let launch = &fixture.bearer;
+    let provider_proof = fixture
+        .proof_signer
+        .sign(launch, &fixture.key, "fixture-token-service")
+        .unwrap();
+    let proof = sign(launch);
+    assert!(refresh(launch, None, vec![]).await.is_err());
+    assert!(
+        refresh(launch, Some(&provider_proof), vec![])
+            .await
+            .is_err()
+    );
+    assert!(
+        refresh(launch, Some(&proof), vec!["extension".into()])
+            .await
+            .is_err()
+    );
+    fixture.revoked.store(true, Ordering::Release);
+    assert!(refresh(launch, Some(&proof), vec![]).await.is_err());
+    fixture.revoked.store(false, Ordering::Release);
+    let response = refresh(launch, Some(&proof), vec![])
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(response.token, *launch);
+    assert!(response.extension_credentials.is_empty());
+    assert!(refresh(launch, Some(&proof), vec![]).await.is_err());
+    let retry = refresh(launch, Some(&sign(launch)), vec![])
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(retry.token, response.token);
+    assert_eq!(retry.sandbox_token, response.sandbox_token);
+
+    let successor = refresh(&response.token, Some(&sign(&response.token)), vec![])
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(successor.token, response.token);
+    assert!(refresh(launch, Some(&sign(launch)), vec![]).await.is_err());
+    let auth = SandboxSessionJwtAuthenticator::new(
+        fixture.state.sandbox_session_jwt_authority.clone().unwrap(),
+        fixture.state.store.clone(),
+    );
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::AUTHORIZATION,
+        format!("Bearer {}", successor.token).parse().unwrap(),
+    );
+    let path = "/openshell.v1.OpenShell/GetSandboxConfig";
+    assert!(matches!(
+        auth.authenticate(&headers, path).await.unwrap(),
+        Authentication::Accepted(_)
+    ));
+    let gate = fixture.state.bootstrap_authorization.as_ref().unwrap();
+    gate.revoke(&fixture.grant.decision_id).await.unwrap();
+    assert!(auth.authenticate(&headers, path).await.is_err());
+    assert!(
+        refresh(&successor.token, Some(&sign(&successor.token)), vec![])
+            .await
+            .is_err()
+    );
+    assert_eq!(fixture.vault_reads().await, 0);
+    assert!(fixture.oauth.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]

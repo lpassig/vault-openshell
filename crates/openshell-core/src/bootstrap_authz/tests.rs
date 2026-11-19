@@ -96,7 +96,7 @@ impl BootstrapAuthorizer for MockAuthorizer {
             reason: "test_policy".into(),
             ttl_secs: 30,
             scopes: BTreeSet::from([match request.stage {
-                Stage::Bootstrap => BOOTSTRAP_CAPABILITY,
+                Stage::Bootstrap | Stage::Renewal => BOOTSTRAP_CAPABILITY,
                 Stage::Provider => PROVIDER_CAPABILITY,
                 Stage::Activation => ACTIVATION_CAPABILITY,
             }
@@ -177,7 +177,7 @@ async fn provider(
     spiffe: &str,
     now: i64,
 ) -> Result<Grant, Denial> {
-    gate.provider(
+    gate.workload_permit(
         grant,
         &intent(),
         WorkloadEvidence {
@@ -188,7 +188,7 @@ async fn provider(
         },
         "gateway-jti",
         token,
-        "provider:credential",
+        WorkloadOperation::Provider("provider:credential"),
         now,
     )
     .await
@@ -452,6 +452,25 @@ async fn local_rego_policy_allows_and_denies() {
     let denied = gate.authorizer.decide(&invalid_request).await.unwrap();
     assert!(!denied.allow);
     assert_eq!(denied.reason, "policy_denied");
+    let mut renewal = DecisionRequest {
+        stage: Stage::Renewal,
+        intent: intent(),
+        spiffe_id: Some(intent().expected_spiffe_id),
+        host_id: Some("host-a".into()),
+        runtime_identity: Some("kubernetes://ns/uid/pod".into()),
+        proof_verified: true,
+        selectors: BTreeSet::from(["verified:fixture".into()]),
+        parent_decision_id: Some(grant.decision_id.clone()),
+        resource: RENEWAL_RESOURCE.into(),
+        ..invalid_request.clone()
+    };
+    let allowed = gate.authorizer.decide(&renewal).await.unwrap();
+    assert_eq!(
+        validate_response(&renewal, &allowed, BOOTSTRAP_CAPABILITY),
+        Ok(NOW + 30)
+    );
+    renewal.resource = "provider:credential".into();
+    assert!(!gate.authorizer.decide(&renewal).await.unwrap().allow);
     let mut docker = intent();
     docker.driver = "docker".into();
     let observation = crate::proto::compute::v1::SupervisorRuntimeObservation {

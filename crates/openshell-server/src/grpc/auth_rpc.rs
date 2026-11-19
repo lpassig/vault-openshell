@@ -161,6 +161,11 @@ pub async fn handle_issue_sandbox_token(
                 "bootstrap admission required",
             )
         })?;
+        if grant.launch_decision_id.is_some() {
+            return Err(gate
+                .reject(&sandbox.sandbox_id, "renewed_session_issuance")
+                .await);
+        }
         gate.verify_grant(grant).await.inspect_err(|_| {
             audit::emit_authorization_denial(&principal, AuthzDenial::BootstrapAuthorization);
         })?;
@@ -255,15 +260,6 @@ pub async fn handle_refresh_sandbox_token(
     state: &Arc<ServerState>,
     request: Request<RefreshSandboxTokenRequest>,
 ) -> Result<Response<RefreshSandboxTokenResponse>, Status> {
-    // The first slice has a fixed bootstrap deadline. Renewal must not extend it
-    // or release extension credentials without a fresh proof-capable protocol.
-    if let Some(gate) = &state.bootstrap_authorization {
-        let id = match request.extensions().get::<Principal>() {
-            Some(Principal::Sandbox(p)) => p.sandbox_id.as_str(),
-            _ => "",
-        };
-        return Err(gate.reject(id, "session_renewal").await);
-    }
     let requested_extension_services = request.get_ref().extension_service_names.clone();
     let principal = request
         .extensions()
@@ -292,6 +288,13 @@ pub async fn handle_refresh_sandbox_token(
             "this principal cannot refresh; use IssueSandboxToken for bootstrap",
         ));
     };
+    let gate = state.bootstrap_authorization.as_ref();
+    if let Some(gate) = gate
+        && (state.compute.configured_driver_name() != "kubernetes"
+            || !requested_extension_services.is_empty())
+    {
+        return Err(gate.reject(&sandbox.sandbox_id, "session_renewal").await);
+    }
 
     let issuer = state.extension_jwt_issuer.as_ref().ok_or_else(|| {
         warn!(
@@ -327,11 +330,11 @@ pub async fn handle_refresh_sandbox_token(
         &Principal::Sandbox(sandbox.clone()),
         request.metadata().as_ref(),
     );
-    let (successor, should_rotate) = match authorization {
+    let (mut successor, should_rotate) = match authorization {
         crate::auth::sandbox_session::RefreshAuthorization::Current(identity) => (
             identity
                 .next_gateway_token(
-                    request_hash,
+                    request_hash.clone(),
                     issued_at,
                     REFRESH_REPLAY_GRACE
                         .as_secs()
@@ -343,9 +346,71 @@ pub async fn handle_refresh_sandbox_token(
         ),
         crate::auth::sandbox_session::RefreshAuthorization::Replay(identity) => (identity, false),
     };
+    let authorized_revision = if let Some(gate) = gate {
+        let Some(proof) = crate::auth::bootstrap::workload_proof(request.metadata()) else {
+            return Err(gate
+                .reject(&sandbox.sandbox_id, "session_renewal_proof")
+                .await);
+        };
+        let permit = gate
+            .renewal_permit(state, &principal, proof)
+            .await
+            .inspect_err(|_| {
+                audit::emit_authorization_denial(
+                    &Principal::Sandbox(sandbox.clone()),
+                    AuthzDenial::BootstrapAuthorization,
+                );
+            })?;
+        let revision = gate.recheck_evidence(state, &principal, &permit).await?;
+        if should_rotate {
+            gate.persist_grant(&permit).await?;
+            successor.bootstrap = Some(permit);
+        } else {
+            let committed = successor
+                .bootstrap
+                .as_ref()
+                .ok_or_else(|| Status::permission_denied("renewal decision is missing"))?;
+            gate.verify_grant(committed).await?;
+            if gate.recheck_evidence(state, &principal, committed).await? != revision {
+                return Err(Status::aborted(
+                    "sandbox changed after renewal authorization",
+                ));
+            }
+            crate::auth::bootstrap::BootstrapRuntime::verify_permit_deadline(&permit)?;
+            // The proof was validated against the previous bearer. The
+            // committed successor must still be the one eligible for retry.
+            if !matches!(
+                crate::auth::sandbox_session::authorize_refresh(
+                    &state.store,
+                    &principal,
+                    &request_hash,
+                    current_unix_seconds(),
+                ).await.map_err(|rejection| rejection.status)?,
+                crate::auth::sandbox_session::RefreshAuthorization::Replay(current)
+                    if current == successor
+            ) {
+                return Err(Status::unauthenticated(
+                    "refresh retry no longer matches the active lineage",
+                ));
+            }
+        }
+        Some(revision)
+    } else {
+        None
+    };
+    let sandbox_record = ensure_sandbox_exists(state, &sandbox.sandbox_id).await?;
+    if authorized_revision.is_some_and(|revision| {
+        sandbox_record.metadata.as_ref().map(|m| m.resource_version) != Some(revision)
+    }) {
+        return Err(Status::aborted(
+            "sandbox changed after renewal authorization",
+        ));
+    }
+    if gate.is_some() && principal.expires_at <= current_unix_seconds() {
+        return Err(Status::unauthenticated("presented renewal token expired"));
+    }
     let authentication =
         session_authority.mint_persisted_launch(&sandbox.sandbox_id, &successor)?;
-    let sandbox_record = ensure_sandbox_exists(state, &sandbox.sandbox_id).await?;
     let extension_credentials = if requested_extension_services.is_empty() {
         Vec::new()
     } else if !state
@@ -387,8 +452,22 @@ pub async fn handle_refresh_sandbox_token(
         )?
     };
     if should_rotate {
-        crate::auth::sandbox_session::rotate_gateway_token(&state.store, &principal, &successor)
-            .await?;
+        crate::auth::sandbox_session::rotate_gateway_token(
+            &state.store,
+            &principal,
+            &successor,
+            authorized_revision,
+        )
+        .await?;
+    }
+    if let Some(gate) = gate {
+        // Revocation may race the sandbox CAS. A revoked decision never
+        // authorizes delivery or subsequent gateway requests.
+        let grant = successor
+            .bootstrap
+            .as_ref()
+            .ok_or_else(|| Status::permission_denied("renewal decision is missing"))?;
+        gate.verify_grant(grant).await?;
     }
     info!(
         sandbox_id = %sandbox.sandbox_id,
