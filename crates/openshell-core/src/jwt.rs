@@ -1609,13 +1609,14 @@ mod tests {
 
         #[test]
         fn bootstrap_claims_cap_both_profiles_and_preserve_legacy_shape() {
+            use base64::Engine as _;
+
             let (issuer, gateway, sandbox, identity) = fixture();
             let legacy = issuer.mint_pair(&identity).unwrap();
             let claims = gateway
                 .verify(legacy.gateway.token.expose_secret())
                 .unwrap();
             assert!(claims.bootstrap.is_none());
-            use base64::Engine as _;
             let payload = legacy
                 .gateway
                 .token

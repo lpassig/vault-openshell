@@ -32,6 +32,24 @@ struct MockDevice {
     missing: bool,
 }
 
+struct FailingStore {
+    fail_audit: bool,
+}
+
+#[async_trait]
+impl DecisionStore for FailingStore {
+    async fn record(&self, _: &AuditRecord) -> Result<(), Denial> {
+        if self.fail_audit {
+            Err(Denial::ReplayOrPersistence)
+        } else {
+            Ok(())
+        }
+    }
+    async fn consume_proof(&self, _: &str, _: i64) -> Result<(), Denial> {
+        Err(Denial::ReplayOrPersistence)
+    }
+}
+
 #[async_trait]
 impl DeviceAttestationAdapter for MockDevice {
     async fn attest(&self, context: &AttestationContext) -> Result<DeviceAttestation, Denial> {
@@ -212,6 +230,32 @@ async fn explicit_policy_deny_is_audited() {
 }
 
 #[tokio::test]
+async fn audit_or_replay_store_failure_cannot_authorize() {
+    let (mut gate, _, key) = fixture();
+    let grant = gate
+        .bootstrap(intent(), "test-device-session", NOW)
+        .await
+        .unwrap();
+    gate.store = Arc::new(FailingStore { fail_audit: true });
+    assert_eq!(
+        gate.bootstrap(intent(), "test-device-session", NOW).await,
+        Err(Denial::ReplayOrPersistence)
+    );
+    gate.store = Arc::new(FailingStore { fail_audit: false });
+    assert_eq!(
+        provider(
+            &gate,
+            &grant,
+            &proof(&grant, &key, Uuid::new_v4()),
+            &intent().expected_spiffe_id,
+            NOW
+        )
+        .await,
+        Err(Denial::ReplayOrPersistence)
+    );
+}
+
+#[tokio::test]
 async fn missing_signal_and_expired_attestation_fail_closed() {
     let (gate, _, _) = fixture();
     assert_eq!(
@@ -267,7 +311,7 @@ async fn authorizer_timeout_fails_closed_and_is_audited() {
     gate.timeout = Duration::from_millis(5);
     gate.authorizer = Arc::new(MockAuthorizer {
         allow: true,
-        delay: Duration::from_secs(60),
+        delay: Duration::from_mins(1),
     });
     assert_eq!(
         gate.bootstrap(intent(), "test-device-session", NOW).await,

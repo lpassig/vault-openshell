@@ -648,15 +648,21 @@ impl BootstrapGate {
             resource: resource.into(),
             scopes: grant.map_or_else(BTreeSet::new, |v| v.scopes.clone()),
         };
-        tokio::time::timeout(self.timeout, self.store.record(&record))
+        let persisted = tokio::time::timeout(self.timeout, self.store.record(&record))
             .await
-            .map_err(|_| Denial::Timeout)??;
+            .unwrap_or(Err(Denial::Timeout));
+        // A failed durable write must remain observable in the independent log
+        // sink, and must never be reported there as permission to issue a token.
+        let allow = record.allow && persisted.is_ok();
+        let reason = persisted
+            .as_ref()
+            .map_or_else(ToString::to_string, |()| record.reason.clone());
         tracing::info!(target: "openshell::bootstrap_authz", decision_id = %record.decision_id,
             parent_decision_id = ?record.parent_decision_id, stage = ?record.stage,
             sandbox_id = %intent.sandbox_id, generation = %intent.generation,
-            device_id = ?record.device_id, allow = record.allow, reason = %record.reason,
+            device_id = ?record.device_id, allow, policy_allow = record.allow, reason,
             expires_at = record.expires_at, "bootstrap authorization decision");
-        Ok(())
+        persisted
     }
 }
 

@@ -15,7 +15,7 @@ Verified implementation: Gate 2 protects `GetSandboxProviderAccessToken` before 
 
 Verified implementation: this slice issues a single-use, resource-bound Gate 2 permit for each provider operation. It does not promote the bootstrap JWT into a reusable provider-capable bearer. Enabled mode bypasses token caches, rejects session renewal and extension issuance, and rejects legacy intermediate exchanges and credential-bearing configuration snapshots, including cached snapshots. New generations or takeover terms without fresh admission cannot mint credentials through a bootstrap-required signing authority. These restrictions narrow the implementation relative to the broader design; they preserve denial until each additional path can verify key possession.
 
-Verified implementation: immutable decision records and proof receipts use the existing durable object store. Proof receipt creation is atomic across replicas. Every core gate evaluation records allow/deny and emits structured fields without credentials. Grant revocation removes the stored grant, which subsequent enforcement rereads. Independent administrative provider storage/refresh remains outside sandbox admission.
+Verified implementation: immutable decision records and proof receipts use the existing durable object store. Proof receipt creation is atomic across replicas. Every core gate evaluation requires durable allow/deny recording before returning permission and emits structured fields without credentials. Persistence failure denies and still emits an independent denial log. Grant revocation removes the stored grant, which subsequent enforcement rereads. Independent administrative provider storage/refresh remains outside sandbox admission.
 
 ## Proof protocol
 
@@ -39,7 +39,7 @@ Unverified follow-up work: proof-capable static-secret/configuration delivery, r
 
 ## Validation boundaries
 
-Verified test coverage in source: core tests cover allow/deny, missing/expired attestation, wrong trust domain and exact sandbox identity, authorizer timeout, scope expansion, old decisions, proof replay and a stolen bootstrap bearer signing with an attacker key. JWT tests check both profile TTL caps and absence of the new claim in legacy serialization. See [core tests](../../crates/openshell-core/src/bootstrap_authz/tests.rs) and [JWT tests](../../crates/openshell-core/src/jwt.rs).
+Verified test coverage in source: core tests cover allow/deny, missing/expired attestation, wrong trust domain and exact sandbox identity, authorizer timeout, audit/replay persistence failure, scope expansion, old decisions, proof replay and a stolen bootstrap bearer signing with an attacker key. JWT tests check both profile TTL caps and absence of the new claim in legacy serialization. See [core tests](../../crates/openshell-core/src/bootstrap_authz/tests.rs) and [JWT tests](../../crates/openshell-core/src/jwt.rs).
 
 Verified test fixture: the gateway RPC integration uses an actual mock SPIRE Workload API over a Unix socket, a mock broker adapter that cryptographically validates its SVID, the real Vault credential driver against a mock Vault HTTP backend, and a mock OAuth endpoint. It checks that missing/wrong/replayed proofs and revoked posture cause zero additional Vault reads or OAuth exchanges. The broker's real X.509/mTLS transport is outside this fixture; this test does not qualify a SPIRE deployment. See [the integration fixture](../../crates/openshell-server/src/grpc/provider/access_token/bootstrap_tests.rs).
 
