@@ -92,6 +92,23 @@ fn bootstrap_observation_requires_the_live_driver_supervisor() {
 }
 
 #[test]
+fn bootstrap_spiiffe_socket_requires_gateway_tls_and_dedicated_use() {
+    let bind = "127.0.0.1:8080".parse().unwrap();
+    let mut config = DockerComputeConfig {
+        bootstrap_spiffe_workload_api_socket: Some("/run/spire/agent.sock".into()),
+        ..Default::default()
+    };
+    assert!(config.validate_configuration(bind).is_err());
+    config.guest_tls_ca = Some("/run/openshell/gateway-ca.pem".into());
+    assert!(config.validate_configuration(bind).is_ok());
+    config.provider_spiffe_workload_api_socket = Some("/run/spire/provider.sock".into());
+    assert!(config.validate_configuration(bind).is_err());
+    config.provider_spiffe_workload_api_socket = None;
+    config.bootstrap_spiffe_workload_api_socket = Some("tcp:127.0.0.1:8080".into());
+    assert!(config.validate_configuration(bind).is_err());
+}
+
+#[test]
 fn startup_error_log_tails_fit_grpc_header_budget() {
     // Multibyte text exercises both the UTF-8 cut and worst-case gRPC message
     // percent encoding. Preserve the supervisor's final diagnostic.
@@ -430,6 +447,7 @@ pub fn runtime_config() -> DockerDriverRuntimeConfig {
         upstream_proxy: UpstreamProxyConfig::default(),
         proxy_ca_bundle: None,
         provider_spiffe_workload_api_socket: None,
+        bootstrap_spiffe_workload_api_socket: None,
         app_armor_profile: Some(AppArmorProfile::Unconfined),
         network_trust: None,
     }
@@ -1579,6 +1597,7 @@ fn docker_child_environment_strips_supervisor_control_keys() {
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
     for key in [
+        openshell_core::sandbox_env::BOOTSTRAP_SPIFFE_WORKLOAD_API_SOCKET,
         openshell_core::sandbox_env::ENDPOINT,
         openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
         openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,

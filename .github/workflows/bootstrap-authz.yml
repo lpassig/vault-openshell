@@ -11,6 +11,8 @@ on:
       - "crates/openshell-crypto/**"
       - "crates/openshell-driver-docker/**"
       - "crates/openshell-server/**"
+      - "crates/openshell-spire/**"
+      - "crates/openshell-supervisor/**"
       - "proto/compute_driver.proto"
       - ".github/workflows/bootstrap-authz.yml"
       - "Cargo.lock"
@@ -20,6 +22,8 @@ on:
       - "crates/openshell-crypto/**"
       - "crates/openshell-driver-docker/**"
       - "crates/openshell-server/**"
+      - "crates/openshell-spire/**"
+      - "crates/openshell-supervisor/**"
       - "proto/compute_driver.proto"
       - ".github/workflows/bootstrap-authz.yml"
       - "Cargo.lock"
@@ -61,7 +65,9 @@ jobs:
       - name: SPIFFE client identity verification
         run: cargo test --locked -p openshell-crypto --lib --test spiffe_client
       - name: Docker supervisor observation
-        run: cargo test --locked -p openshell-driver-docker --lib bootstrap_observation
+        run: cargo test --locked -p openshell-driver-docker --lib bootstrap_
+      - name: Supervisor SPIFFE transport
+        run: cargo check --locked -p openshell-supervisor
       - name: Core authorization and JWT regressions
         run: cargo test --locked -p openshell-core --no-default-features --features bootstrap-authz --lib -- --include-ignored
       - name: Gateway and Vault security integration

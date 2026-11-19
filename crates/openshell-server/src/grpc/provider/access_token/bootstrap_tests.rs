@@ -45,6 +45,68 @@ struct Jwt {
     svid: String,
 }
 
+#[derive(Clone, prost::Message)]
+struct X509Identity {
+    #[prost(string, tag = "1")]
+    id: String,
+    #[prost(bytes, tag = "2")]
+    cert: Vec<u8>,
+    #[prost(bytes, tag = "3")]
+    key: Vec<u8>,
+    #[prost(bytes, tag = "4")]
+    bundle: Vec<u8>,
+}
+
+#[derive(Clone, prost::Message)]
+struct X509Response {
+    #[prost(message, repeated, tag = "1")]
+    identities: Vec<X509Identity>,
+}
+
+#[derive(Clone)]
+struct MockX509WorkloadApi(Arc<X509Response>);
+
+impl tonic::server::NamedService for MockX509WorkloadApi {
+    const NAME: &'static str = "SpiffeWorkloadAPI";
+}
+
+impl tower::Service<http::Request<tonic::body::Body>> for MockX509WorkloadApi {
+    type Response = http::Response<tonic::body::Body>;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+        let api = self.clone();
+        Box::pin(async move {
+            struct Fetch(MockX509WorkloadApi);
+            impl tonic::server::ServerStreamingService<()> for Fetch {
+                type Response = X509Response;
+                type ResponseStream =
+                    tokio_stream::Iter<std::iter::Once<Result<X509Response, Status>>>;
+                type Future = std::future::Ready<Result<Response<Self::ResponseStream>, Status>>;
+
+                fn call(&mut self, request: Request<()>) -> Self::Future {
+                    assert_eq!(
+                        request.metadata().get("workload.spiffe.io").unwrap(),
+                        "true"
+                    );
+                    std::future::ready(Ok(Response::new(tokio_stream::iter(std::iter::once(Ok(
+                        self.0.0.as_ref().clone(),
+                    ))))))
+                }
+            }
+            assert_eq!(request.uri().path(), "/SpiffeWorkloadAPI/FetchX509SVID");
+            Ok(tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                .server_streaming(Fetch(api), request)
+                .await)
+        })
+    }
+}
+
 #[derive(Clone)]
 struct MockWorkloadApi(Arc<jsonwebtoken::EncodingKey>);
 impl tonic::server::NamedService for MockWorkloadApi {
@@ -207,6 +269,18 @@ impl Drop for AbortServer {
 
 #[tokio::test]
 async fn bootstrap_docker_configuration_requires_the_live_mtls_supervisor() {
+    let directory = crate::test_environment::fixture_dir().unwrap();
+    crate::test_environment::Environment::new()
+        .set(
+            openshell_core::sandbox_env::TLS_CA,
+            directory.path().join("ca.pem"),
+        )
+        .remove(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME)
+        .run_async(assert_docker_configuration_admission(directory.path()))
+        .await;
+}
+
+async fn assert_docker_configuration_admission(directory: &std::path::Path) {
     use crate::auth::bootstrap::{
         ACTIVATION_ANNOTATION, BootstrapRuntime, PersistentDecisionStore,
     };
@@ -216,6 +290,7 @@ async fn bootstrap_docker_configuration_requires_the_live_mtls_supervisor() {
     use crate::multiplex::MultiplexService;
     use compute::v1::SupervisorRuntimeObservation;
     use open_shell_client::OpenShellClient;
+    use openshell_core::grpc_client::{self, GatewayCredentials, GatewayEndpoint};
     use openshell_crypto::tls::spiffe::SpiffeClientVerifier;
     use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
@@ -232,8 +307,7 @@ async fn bootstrap_docker_configuration_requires_the_live_mtls_supervisor() {
     ));
     let mut state =
         crate::grpc::test_support::test_server_state_with_compute_driver("docker", driver).await;
-    let directory = tempfile::tempdir().unwrap();
-    let (ca, ca_key) = crate::tls_test_utils::generate_test_certs_with_ca(directory.path());
+    let (ca, ca_key) = crate::tls_test_utils::generate_test_certs_with_ca(directory);
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca.der().clone()).unwrap();
     let verifier = SpiffeClientVerifier::new("example.org".into(), roots).unwrap();
@@ -315,9 +389,9 @@ async fn bootstrap_docker_configuration_requires_the_live_mtls_supervisor() {
     };
 
     let acceptor = crate::TlsAcceptor::from_files(
-        &directory.path().join("server-cert.pem"),
-        &directory.path().join("server-key.pem"),
-        Some(&directory.path().join("ca.pem")),
+        &directory.join("server-cert.pem"),
+        &directory.join("server-key.pem"),
+        Some(&directory.join("ca.pem")),
         false,
         None,
         None,
@@ -444,10 +518,60 @@ async fn bootstrap_docker_configuration_requires_the_live_mtls_supervisor() {
         tonic::Code::PermissionDenied
     );
     revoked.store(false, Ordering::Release);
-    client
-        .report_sandbox_configuration(report(accepted))
+    let socket_dir = tempfile::Builder::new()
+        .prefix("svid-test-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let socket = socket_dir.path().join("spire.sock");
+    let workload_listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = rcgen::IsCa::ExplicitNoCa;
+    params.subject_alt_names = vec![rcgen::SanType::URI(
+        expected_spiffe.as_str().try_into().unwrap(),
+    )];
+    params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+    let key = openshell_crypto::pki::generate_keypair().unwrap();
+    let cert = openshell_crypto::pki::signed_by(params, &key, &ca, &ca_key).unwrap();
+    let workload = MockX509WorkloadApi(Arc::new(X509Response {
+        identities: vec![X509Identity {
+            id: expected_spiffe.clone(),
+            cert: cert.der().to_vec(),
+            key: key.serialize_der().unwrap(),
+            bundle: ca.der().to_vec(),
+        }],
+    }));
+    let _workload_server = AbortServer(tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(workload)
+            .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(
+                workload_listener,
+            ))
+            .await
+            .unwrap();
+    }));
+    let endpoint = GatewayEndpoint::new(
+        format!("https://localhost:{}", address.port()),
+        GatewayCredentials::from_gateway_token(launch.supervisor.gateway_token.expose_secret())
+            .unwrap(),
+    );
+    let snapshot = grpc_client::fetch_settings_snapshot(&endpoint, sandbox_id)
         .await
         .unwrap();
+    let svid = openshell_spire::supervisor_tls_identity(&socket)
+        .await
+        .unwrap();
+    grpc_client::report_sandbox_configuration_with_identity(
+        &endpoint,
+        sandbox_id,
+        &accepted.instance_id,
+        Some(&snapshot),
+        ConfigurationAdmissionState::Accepted,
+        "",
+        Some(svid),
+    )
+    .await
+    .unwrap();
     let stored = state
         .store
         .get_message::<Sandbox>(sandbox_id)
