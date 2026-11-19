@@ -15,6 +15,8 @@ pub mod auth;
 #[cfg(feature = "bootstrap-authz")]
 pub mod bootstrap_authz;
 pub mod bootstrap_identity;
+#[cfg(feature = "jwt")]
+pub mod bootstrap_signer;
 pub mod color;
 pub mod compute;
 pub mod config;

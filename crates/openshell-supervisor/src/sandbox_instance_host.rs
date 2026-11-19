@@ -736,7 +736,21 @@ pub fn sandbox_instance_launch(
         .directory
         .get_or_insert_with(|| dir.to_path_buf());
     // Log push, supervision, and renewal share these credentials.
-    let gateway_credentials = GatewayCredentials::from_auth_bundle(&config.auth_bundle)?;
+    let mut gateway_credentials = GatewayCredentials::from_auth_bundle(&config.auth_bundle)?;
+    if let Some(directory) =
+        std::env::var_os(openshell_core::sandbox_env::BOOTSTRAP_WORKLOAD_KEY_DIR)
+    {
+        let sandbox_id = config
+            .sandbox_id
+            .as_deref()
+            .ok_or_else(|| miette::miette!("workload proof requires a sandbox assignment"))?;
+        let signer = openshell_core::bootstrap_signer::BootstrapProofSigner::new(
+            directory.into(),
+            sandbox_id,
+            &config.auth_bundle,
+        )?;
+        gateway_credentials = gateway_credentials.with_workload_proof_signer(signer);
+    }
     let log_push = config
         .sandbox_id
         .clone()

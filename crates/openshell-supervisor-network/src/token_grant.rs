@@ -312,9 +312,17 @@ impl TokenGrantResolver for GatewayTokenGrantResolver {
         request: TokenGrantRequest<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<String, TokenGrantFailure>> + Send + 'a>> {
         Box::pin(async move {
+            let svid_audience = oauth::effective_jwt_svid_audience(
+                request.token_endpoint,
+                request.jwt_svid_audience,
+            );
             let token = self
                 .gateway
-                .get_access_token(request.provider_key, Some(request.request_id))
+                .get_access_token_with_svid_audience(
+                    request.provider_key,
+                    Some(request.request_id),
+                    &svid_audience,
+                )
                 .await?;
             validate_access_token(&token.access_token)?;
             Ok(token.access_token)

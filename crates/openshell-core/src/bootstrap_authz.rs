@@ -55,7 +55,10 @@ pub enum Denial {
     ReplayOrPersistence,
 }
 
-pub use crate::bootstrap_identity::{Grant, SandboxIntent};
+pub use crate::bootstrap_identity::{Grant, ProofClaims, SandboxIntent};
+use crate::bootstrap_identity::{
+    WORKLOAD_PROOF_ISSUER, WORKLOAD_PROOF_TTL_SECS, WORKLOAD_PROOF_TYPE,
+};
 
 /// Challenge delivered only to a trusted attestation adapter.
 #[derive(Clone)]
@@ -260,27 +263,6 @@ pub struct WorkloadEvidence<'a> {
     pub runtime_identity: &'a str,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProofClaims {
-    pub iss: String,
-    pub sub: String,
-    pub aud: String,
-    pub iat: i64,
-    pub exp: i64,
-    pub jti: String,
-    pub decision_id: String,
-    pub challenge: String,
-    pub sandbox_id: String,
-    pub generation: String,
-    pub auth_epoch: u64,
-    pub gateway_token_id: String,
-    pub device_id: String,
-    pub runtime_identity: String,
-    pub resource: String,
-    pub svid_audience: String,
-}
-
 pub struct ProofContext<'a> {
     pub grant: &'a Grant,
     pub workload: &'a WorkloadEvidence<'a>,
@@ -312,14 +294,14 @@ impl WorkloadProofVerifier for JwtWorkloadProofVerifier {
         use jsonwebtoken::{Algorithm, DecodingKey, Validation};
         let key = DecodingKey::from_ed_pem(key_pem).map_err(|_| Denial::InvalidProof)?;
         let mut validation = Validation::new(Algorithm::EdDSA);
-        validation.set_issuer(&["openshell-workload-proof"]);
+        validation.set_issuer(&[WORKLOAD_PROOF_ISSUER]);
         validation.set_audience(&[context.grant.intent.gateway_id.as_str()]);
         // Enforce time against the gateway's supplied clock, without library leeway.
         validation.validate_exp = false;
         validation.leeway = 0;
         let decoded = openshell_crypto::jwt::decode::<ProofClaims>(token, &key, &validation)
             .map_err(|_| Denial::InvalidProof)?;
-        if decoded.header.typ.as_deref() != Some("openshell-bootstrap-proof+jwt") {
+        if decoded.header.typ.as_deref() != Some(WORKLOAD_PROOF_TYPE) {
             return Err(Denial::InvalidProof);
         }
         let proof = decoded.claims;
@@ -336,9 +318,9 @@ impl WorkloadProofVerifier for JwtWorkloadProofVerifier {
             || proof.resource != context.resource
             || proof.svid_audience != context.workload.audience
             || proof.iat > context.now
-            || proof.iat < context.now.saturating_sub(30)
+            || proof.iat < context.now.saturating_sub(WORKLOAD_PROOF_TTL_SECS)
             || proof.exp <= context.now
-            || proof.exp > proof.iat.saturating_add(30)
+            || proof.exp > proof.iat.saturating_add(WORKLOAD_PROOF_TTL_SECS)
             || Uuid::parse_str(&proof.jti).is_err()
         {
             return Err(Denial::InvalidProof);

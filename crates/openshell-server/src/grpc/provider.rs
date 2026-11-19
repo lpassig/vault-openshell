@@ -26,6 +26,7 @@ use crate::storage_proto::{
 };
 use openshell_core::dynamic_credential_key::DynamicCredentialKey;
 use openshell_core::metadata::ObjectWorkspace;
+use openshell_core::oauth::effective_jwt_svid_audience;
 use openshell_core::proto::{
     CredentialHandle, Provider, ProviderCredentialRefreshStrategy,
     ProviderCredentialTokenGrantAudienceOverride, ProviderCredentialTokenGrantType,
@@ -4894,24 +4895,6 @@ async fn perform_intermediate_token_exchange(
                 .at_stage(TokenGrantStage::IntermediateExchange)
                 .to_status()
         })
-}
-
-fn effective_jwt_svid_audience(token_endpoint: &str, jwt_svid_audience: &str) -> String {
-    if !jwt_svid_audience.trim().is_empty() {
-        return jwt_svid_audience.to_string();
-    }
-    derive_issuer_from_token_endpoint(token_endpoint)
-}
-
-fn derive_issuer_from_token_endpoint(token_endpoint: &str) -> String {
-    if let Some(realms_idx) = token_endpoint.find("/realms/") {
-        let after_realms = &token_endpoint[realms_idx + "/realms/".len()..];
-        if let Some(slash_idx) = after_realms.find('/') {
-            let realm_end = realms_idx + "/realms/".len() + slash_idx;
-            return token_endpoint[..realm_end].to_string();
-        }
-    }
-    token_endpoint.to_string()
 }
 
 pub(super) async fn handle_get_provider_refresh_status(

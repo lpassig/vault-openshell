@@ -83,6 +83,8 @@ enum TokenSource {
 #[derive(Clone)]
 pub struct GatewayCredentials {
     inner: Arc<CredentialState>,
+    #[cfg(feature = "jwt")]
+    workload_proof_signer: Option<Arc<crate::bootstrap_signer::BootstrapProofSigner>>,
 }
 
 struct CredentialState {
@@ -130,6 +132,8 @@ impl GatewayCredentials {
                 sandbox_bearer: None,
                 renewal: std::sync::Mutex::new(Renewal::Idle),
             }),
+            #[cfg(feature = "jwt")]
+            workload_proof_signer: None,
         }
     }
 
@@ -150,7 +154,18 @@ impl GatewayCredentials {
                 sandbox_bearer: Some(sandbox_bearer),
                 renewal: std::sync::Mutex::new(Renewal::Idle),
             }),
+            workload_proof_signer: None,
         })
+    }
+
+    #[cfg(feature = "jwt")]
+    #[must_use]
+    pub fn with_workload_proof_signer(
+        mut self,
+        signer: crate::bootstrap_signer::BootstrapProofSigner,
+    ) -> Self {
+        self.workload_proof_signer = Some(Arc::new(signer));
+        self
     }
 
     /// Use a caller-supplied gateway JWT. Renewal cannot rebootstrap it.
@@ -341,11 +356,32 @@ fn validate_sandbox_refresh(
 #[derive(Clone)]
 pub struct AuthInterceptor {
     bearer: TokenSlot,
+    #[cfg(feature = "jwt")]
+    workload_proof_signer: Option<Arc<crate::bootstrap_signer::BootstrapProofSigner>>,
+}
+
+#[cfg(feature = "jwt")]
+#[derive(Clone)]
+struct WorkloadProofTarget {
+    key: String,
+    svid_audience: String,
 }
 
 impl AuthInterceptor {
     fn new(bearer: TokenSlot) -> Self {
-        Self { bearer }
+        Self {
+            bearer,
+            #[cfg(feature = "jwt")]
+            workload_proof_signer: None,
+        }
+    }
+
+    fn for_provider(credentials: &GatewayCredentials) -> Self {
+        Self {
+            bearer: credentials.inner.bearer.clone(),
+            #[cfg(feature = "jwt")]
+            workload_proof_signer: credentials.workload_proof_signer.clone(),
+        }
     }
 }
 
@@ -362,6 +398,30 @@ impl tonic::service::Interceptor for AuthInterceptor {
             .ok_or_else(|| {
                 Status::unauthenticated("sandbox instance gateway credentials were revoked")
             })?;
+        #[cfg(feature = "jwt")]
+        if let Some(signer) = &self.workload_proof_signer {
+            let target = req
+                .extensions_mut()
+                .remove::<WorkloadProofTarget>()
+                .ok_or_else(|| {
+                    Status::permission_denied("missing provider workload proof target")
+                })?;
+            let token = bearer
+                .to_str()
+                .ok()
+                .and_then(crate::auth::strip_bearer_scheme)
+                .ok_or_else(|| Status::unauthenticated("invalid provider gateway bearer"))?;
+            let proof = signer
+                .sign(token, &target.key, &target.svid_audience)
+                .map_err(|_| {
+                    Status::permission_denied("cannot sign the provider workload proof")
+                })?;
+            let mut metadata = AsciiMetadataValue::try_from(proof)
+                .map_err(|_| Status::permission_denied("invalid provider workload proof"))?;
+            metadata.set_sensitive(true);
+            req.metadata_mut()
+                .insert(crate::bootstrap_identity::WORKLOAD_PROOF_HEADER, metadata);
+        }
         req.metadata_mut().insert("authorization", bearer);
         #[cfg(feature = "trace-context")]
         let req =
@@ -1798,11 +1858,21 @@ impl SandboxProviderTokenClient {
     ///
     /// One deadline bounds connection readiness and the call. Network failures
     /// do not serialize channel initialization for concurrent requests.
-    #[tracing::instrument(name = "supervisor.gateway.get_provider_access_token", skip_all)]
     pub async fn get_access_token(
         &self,
         credential_key: &str,
         request_id: Option<&str>,
+    ) -> std::result::Result<ProviderSubjectTokenExchangeResult, TokenGrantFailure> {
+        self.get_access_token_with_svid_audience(credential_key, request_id, "")
+            .await
+    }
+
+    #[tracing::instrument(name = "supervisor.gateway.get_provider_access_token", skip_all)]
+    pub async fn get_access_token_with_svid_audience(
+        &self,
+        credential_key: &str,
+        request_id: Option<&str>,
+        svid_audience: &str,
     ) -> std::result::Result<ProviderSubjectTokenExchangeResult, TokenGrantFailure> {
         let (endpoint, gateway) = self.gateway.as_ref().map_err(|failure| *failure)?;
         // Like connect(), refuse locally revoked sandbox instance credentials
@@ -1819,19 +1889,35 @@ impl SandboxProviderTokenClient {
         if let Some(value) = request_id.and_then(|value| value.parse().ok()) {
             request.metadata_mut().insert("x-request-id", value);
         }
+        #[cfg(not(feature = "jwt"))]
+        let _ = svid_audience;
+        #[cfg(feature = "jwt")]
+        if gateway.credentials().workload_proof_signer.is_some() {
+            if endpoint.scheme() != "https" || svid_audience.is_empty() {
+                return Err(gateway_grant_failure(TokenGrantFailureKind::Configuration));
+            }
+            let target = WorkloadProofTarget {
+                key: request.get_ref().credential_key.clone(),
+                svid_audience: svid_audience.into(),
+            };
+            request.extensions_mut().insert(target);
+        }
         let response = tokio::time::timeout(self.deadline, async {
             let mut client = self
                 .client
                 .get_or_try_init(|| async {
                     let channel = build_plain_endpoint(gateway.url())?.connect_lazy();
-                    let intercepted = InterceptedService::new(
+                    let renewal = InterceptedService::new(
                         channel.clone(),
                         AuthInterceptor::new(gateway.credentials.inner.bearer.clone()),
                     );
                     gateway
                         .credentials
-                        .start_renewal(&intercepted, &channel, gateway.url());
-                    Ok::<_, miette::Report>(OpenShellClient::new(intercepted))
+                        .start_renewal(&renewal, &channel, gateway.url());
+                    Ok::<_, miette::Report>(OpenShellClient::new(InterceptedService::new(
+                        channel,
+                        AuthInterceptor::for_provider(gateway.credentials()),
+                    )))
                 })
                 .await
                 .map_err(|_| unavailable())?

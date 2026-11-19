@@ -33,7 +33,7 @@ use crate::persistence::{ObjectId, ObjectWorkspace, Store, WriteCondition};
 const AUDIT_TYPE: &str = "bootstrap_authorization_decision";
 const GRANT_TYPE: &str = "bootstrap_authorization_grant";
 const PROOF_TYPE: &str = "bootstrap_authorization_proof";
-pub const PROOF_HEADER: &str = "x-openshell-workload-proof";
+pub use openshell_core::bootstrap_identity::WORKLOAD_PROOF_HEADER as PROOF_HEADER;
 pub const ACTIVATION_ANNOTATION: &str = "internal.openshell.ai/bootstrap-activation";
 
 #[derive(Serialize)]

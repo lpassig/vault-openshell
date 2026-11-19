@@ -476,6 +476,9 @@ pub const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET: &str =
 pub const BOOTSTRAP_SPIFFE_WORKLOAD_API_SOCKET: &str =
     "OPENSHELL_BOOTSTRAP_SPIFFE_WORKLOAD_API_SOCKET";
 
+/// Operator-provisioned per-assignment proof keys on shared supervisors.
+pub const BOOTSTRAP_WORKLOAD_KEY_DIR: &str = "OPENSHELL_BOOTSTRAP_WORKLOAD_KEY_DIR";
+
 /// Resolved sandbox UID used to override `run_as_user` when the policy
 /// specifies a numeric value instead of the hardcoded "sandbox" user name.
 ///

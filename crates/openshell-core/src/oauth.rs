@@ -29,6 +29,20 @@ pub const DEFAULT_TOKEN_CACHE_TTL_SECONDS: i64 = 300;
 pub const TOKEN_CACHE_EXPIRY_SKEW_SECONDS: i64 = 30;
 pub const MAX_TOKEN_EXPIRES_IN_SECONDS: i64 = 3600;
 
+/// Audience used by the gateway and supervisor when acquiring a JWT-SVID.
+#[must_use]
+pub fn effective_jwt_svid_audience(token_endpoint: &str, configured: &str) -> String {
+    if !configured.trim().is_empty() {
+        return configured.to_owned();
+    }
+    if let Some((prefix, suffix)) = token_endpoint.split_once("/realms/")
+        && let Some((realm, _)) = suffix.split_once('/')
+    {
+        return format!("{prefix}/realms/{realm}");
+    }
+    token_endpoint.to_owned()
+}
+
 /// HTTP client that authenticates HTTPS endpoints and never redirects assertions.
 ///
 /// The private client fixes certificate/hostname verification, proxy policy and
