@@ -71,7 +71,7 @@ jobs:
       - name: Supervisor SPIFFE transport
         run: cargo check --locked -p openshell-supervisor
       - name: CLI evidence transport
-        run: cargo test --locked -p openshell-cli --bin openshell create_device_evidence
+        run: cargo test --locked -p openshell-cli --lib create_device_evidence
       - name: Core authorization and JWT regressions
         run: cargo test --locked -p openshell-core --no-default-features --features bootstrap-authz --lib -- --include-ignored
       - name: Gateway and Vault security integration
