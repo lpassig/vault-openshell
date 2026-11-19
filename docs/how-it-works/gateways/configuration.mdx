@@ -1749,7 +1749,17 @@ an authorized policy which the supervisor can apply directly, and leave
 provider attachments empty. Restart the gateway when you change the SPIFFE
 client CA bundle.
 
-Enabled mode rejects Docker session renewal, extension credential issuance,
+On Podman, set `podman_spiffe_id_prefix` in the bootstrap authorization
+table and `bootstrap_spiffe_workload_api_socket` in `[openshell.drivers.podman]`.
+Use the same polling and gateway TLS settings as Docker. Set `guest_tls_ca`,
+leave `provider_spiffe_workload_api_socket` unset, and keep
+`enable_bind_mounts = false`. The socket must be on the Podman daemon's host
+in a dedicated directory accessible to its supervisor. Configure your
+registrar to verify the exact Podman supervisor launch and issue the identity
+`<prefix>/gateway/<gateway-id>/sandbox/<sandbox-id>/generation/<generation>/epoch/<epoch>/supervisor/podman/<container-id>`.
+Leave provider attachments empty.
+
+Enabled mode rejects local runtime session renewal, extension credential issuance,
 credential-bearing configuration snapshots, and legacy intermediate-exchange
 requests. The Kubernetes provider-token path bypasses its cache. Production
 deployments need a posture authority that verifies requester and host posture,

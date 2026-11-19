@@ -157,6 +157,13 @@ Omit `health_check_interval_secs` to disable Podman's periodic health command.
 Explicit zero is invalid. OpenShell still gates readiness on the supervisor's
 authenticated health signal.
 
+Experimental bootstrap authorization mounts the Workload API socket only in
+the supervisor. The driver uses the existing `GetSandbox` observation to
+check the running supervisor and report its immutable container ID,
+generation, and credential epoch. The gateway uses that observation when
+authorizing the supervisor's SPIFFE-authenticated configuration report.
+[Bootstrap configuration](../../docs/how-it-works/gateways/configuration.mdx#experimental-bootstrap-authorization).
+
 Gateway OTLP configuration continues to export compute-driver spans under the
 `openshell-driver-podman` service, preserving gateway trace context.
 When `[openshell.gateway.otlp.agent]` is enabled, the driver sets
