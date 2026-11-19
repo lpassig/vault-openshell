@@ -189,21 +189,7 @@ impl BootstrapRuntime {
     }
 
     pub async fn verify_grant(&self, grant: &Grant) -> Result<(), Status> {
-        let record = self
-            .store
-            .get(
-                GRANT_TYPE,
-                &format!("bootstrap-grant:{}", grant.decision_id),
-            )
-            .await
-            .map_err(|_| status(Denial::ReplayOrPersistence))?
-            .ok_or_else(|| status(Denial::MissingSignal))?;
-        let persisted: Grant = serde_json::from_slice(&record.payload)
-            .map_err(|_| status(Denial::ReplayOrPersistence))?;
-        if &persisted != grant || grant.expires_at <= now() {
-            return Err(status(Denial::StaleEvidence));
-        }
-        Ok(())
+        verify_persisted_grant(&self.store, grant).await
     }
 
     /// Trusted revocation integrations may remove a grant; every request rereads it.
@@ -342,9 +328,8 @@ impl BootstrapRuntime {
         let runtime = sandbox
             .metadata
             .as_ref()
-            .and_then(|m| {
-                m.annotations
-                    .get(crate::compute::COMPUTE_RUNTIME_IDENTITY_ANNOTATION)
+            .and_then(|metadata| {
+                super::compute_driver::recorded_runtime(metadata, &grant.intent.driver)
             })
             .ok_or_else(|| status(Denial::MissingSignal))?;
         let identity = state
@@ -402,11 +387,10 @@ impl BootstrapRuntime {
             .await
             .map_err(|_| status(Denial::Unavailable))?
             .ok_or_else(|| status(Denial::MissingSignal))?;
-        let runtime = sandbox.metadata.as_ref().and_then(|m| {
-            m.annotations
-                .get(crate::compute::COMPUTE_RUNTIME_IDENTITY_ANNOTATION)
+        let runtime = sandbox.metadata.as_ref().and_then(|metadata| {
+            super::compute_driver::recorded_runtime(metadata, &grant.intent.driver)
         });
-        if runtime != permit.runtime_identity.as_ref() {
+        if runtime.is_none() || runtime != permit.runtime_identity.as_deref() {
             return Err(status(Denial::IdentityMismatch));
         }
         let intent = self
@@ -464,6 +448,24 @@ impl BootstrapRuntime {
             "bootstrap authorization requires a proof-capable credential path",
         )
     }
+}
+
+/// Check the gateway-owned decision independently of the sandbox record and JWT.
+pub async fn verify_persisted_grant(store: &Store, grant: &Grant) -> Result<(), Status> {
+    let record = store
+        .get(
+            GRANT_TYPE,
+            &format!("bootstrap-grant:{}", grant.decision_id),
+        )
+        .await
+        .map_err(|_| status(Denial::ReplayOrPersistence))?
+        .ok_or_else(|| status(Denial::MissingSignal))?;
+    let persisted: Grant =
+        serde_json::from_slice(&record.payload).map_err(|_| status(Denial::ReplayOrPersistence))?;
+    if &persisted != grant || grant.expires_at <= now() {
+        return Err(status(Denial::StaleEvidence));
+    }
+    Ok(())
 }
 
 fn canonical_digest(value: &impl Serialize) -> Result<String, Status> {

@@ -304,15 +304,16 @@ impl SandboxSessionJwtAuthority {
                 Status::unauthenticated(format!("invalid gateway session: {error}")),
             )
         })?;
-        if self
+        let bootstrap_required = self
             .bootstrap_required
-            .load(std::sync::atomic::Ordering::Acquire)
-            && session.bootstrap.is_none()
-        {
+            .load(std::sync::atomic::Ordering::Acquire);
+        if bootstrap_required != session.bootstrap.is_some() {
             return Err(AuthRejection::new(
                 AuthMechanism::SandboxJwt,
                 AuthFailureReason::InvalidCredential,
-                Status::permission_denied("bootstrap authorization grant required"),
+                Status::permission_denied(
+                    "session does not match gateway bootstrap authorization mode",
+                ),
             ));
         }
         Ok(session)
@@ -399,12 +400,25 @@ impl Authenticator for SandboxSessionJwtAuthenticator {
             return Ok(Authentication::NotApplicable);
         }
         let authenticated = self.authority.verify_gateway_token(token)?;
-        if authenticated.bootstrap.is_some() && !bootstrap_callable(path) {
-            return Err(AuthRejection::new(
-                AuthMechanism::SandboxJwt,
-                AuthFailureReason::InvalidCredential,
-                Status::permission_denied("bootstrap credential does not authorize this method"),
-            ));
+        if let Some(grant) = &authenticated.bootstrap {
+            if !bootstrap_callable(path) {
+                return Err(AuthRejection::new(
+                    AuthMechanism::SandboxJwt,
+                    AuthFailureReason::InvalidCredential,
+                    Status::permission_denied(
+                        "bootstrap credential does not authorize this method",
+                    ),
+                ));
+            }
+            super::bootstrap::verify_persisted_grant(&self.store, grant)
+                .await
+                .map_err(|status| {
+                    AuthRejection::new(
+                        AuthMechanism::SandboxJwt,
+                        AuthFailureReason::StaleIdentity,
+                        status,
+                    )
+                })?;
         }
         // Refresh performs its own lineage check so the immediately consumed
         // bearer can recover an already-committed successor after a lost

@@ -647,6 +647,8 @@ pub enum AuthzDenial<'a> {
     /// A sandbox requested a credential for an extension service its policy
     /// does not select.
     ExtensionServiceNotSelected { service: &'a str },
+    /// A bootstrap decision did not authorize the request.
+    BootstrapAuthorization,
 }
 
 impl AuthzDenial<'_> {
@@ -662,6 +664,7 @@ impl AuthzDenial<'_> {
             Self::PlatformAdminRequired => "platform_admin_required",
             Self::OperatorRequired => "operator_required",
             Self::ExtensionServiceNotSelected { .. } => "extension_service_not_selected",
+            Self::BootstrapAuthorization => "bootstrap_authorization_denied",
         }
     }
 

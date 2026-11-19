@@ -652,6 +652,68 @@ async fn bootstrap_gate_protects_real_vault_resolution_and_oauth_with_mock_workl
 }
 
 #[tokio::test]
+async fn bootstrap_gate_denies_a_runtime_recorded_for_another_driver() {
+    let fixture = Fixture::new().await;
+    let mut sandbox = fixture
+        .state
+        .store
+        .get_message::<Sandbox>("sandbox-a")
+        .await
+        .unwrap()
+        .unwrap();
+    sandbox.metadata.as_mut().unwrap().annotations.insert(
+        crate::compute::COMPUTE_DRIVER_ANNOTATION.into(),
+        "docker".into(),
+    );
+    fixture.state.store.put_message(&sandbox).await.unwrap();
+
+    let response = handle(&fixture.state, fixture.request(Some(&fixture.signing))).await;
+    assert!(response.is_err());
+    assert_eq!(fixture.vault_reads().await, 0);
+    assert!(fixture.oauth.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn bootstrap_revocation_denies_new_supervisor_control_requests() {
+    use crate::auth::authenticator::{Authentication, Authenticator as _};
+    use crate::auth::sandbox_jwt::SandboxSessionJwtAuthenticator;
+
+    let fixture = Fixture::new().await;
+    let authenticator = SandboxSessionJwtAuthenticator::new(
+        fixture
+            .state
+            .sandbox_session_jwt_authority
+            .as_ref()
+            .unwrap()
+            .clone(),
+        fixture.state.store.clone(),
+    );
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::AUTHORIZATION,
+        format!("Bearer {}", fixture.bearer).parse().unwrap(),
+    );
+    let method = "/openshell.v1.OpenShell/ConnectSupervisor";
+    assert!(matches!(
+        authenticator.authenticate(&headers, method).await.unwrap(),
+        Authentication::Accepted(_)
+    ));
+    fixture
+        .state
+        .bootstrap_authorization
+        .as_ref()
+        .unwrap()
+        .revoke(&fixture.grant.decision_id)
+        .await
+        .unwrap();
+    let rejection = authenticator
+        .authenticate(&headers, method)
+        .await
+        .unwrap_err();
+    assert_eq!(rejection.status.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
 async fn bootstrap_gate_denies_create_before_runtime_or_launch_credentials() {
     use openshell_core::proto::open_shell_server::OpenShell as _;
     let mut fixture = Fixture::new().await;

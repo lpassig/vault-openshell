@@ -131,13 +131,9 @@ pub async fn handle_issue_sandbox_token(
             Status::permission_denied("sandbox runtime identity is unavailable"),
         )
     })?;
-    let expected_driver = metadata
-        .annotations
-        .get(crate::compute::COMPUTE_DRIVER_ANNOTATION);
-    let expected_runtime_identity = metadata
-        .annotations
-        .get(crate::compute::COMPUTE_RUNTIME_IDENTITY_ANNOTATION);
-    if expected_driver != Some(driver_name) || expected_runtime_identity != Some(runtime_identity) {
+    if crate::auth::compute_driver::recorded_runtime(metadata, driver_name)
+        != Some(runtime_identity.as_str())
+    {
         warn!(
             sandbox_id = %sandbox.sandbox_id,
             driver_name,
@@ -158,13 +154,16 @@ pub async fn handle_issue_sandbox_token(
                 )
             })?;
     if let Some(gate) = &state.bootstrap_authorization {
-        gate.verify_grant(
-            identity
-                .bootstrap
-                .as_ref()
-                .ok_or_else(|| Status::permission_denied("bootstrap admission required"))?,
-        )
-        .await?;
+        let grant = identity.bootstrap.as_ref().ok_or_else(|| {
+            audit::deny(
+                &principal,
+                AuthzDenial::BootstrapAuthorization,
+                "bootstrap admission required",
+            )
+        })?;
+        gate.verify_grant(grant).await.inspect_err(|_| {
+            audit::emit_authorization_denial(&principal, AuthzDenial::BootstrapAuthorization);
+        })?;
     }
     audit::emit_handler_logon(&state.logons, &principal, request.metadata().as_ref());
     let authentication = session_authority.mint_persisted_launch(&sandbox.sandbox_id, &identity)?;

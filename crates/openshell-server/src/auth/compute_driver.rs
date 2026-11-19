@@ -8,10 +8,31 @@ use super::authenticator::{AuthRejection, Authentication, Authenticator, bearer_
 use super::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
 use crate::compute::ComputeRuntime;
 use async_trait::async_trait;
+use openshell_core::proto::datamodel::v1::ObjectMeta;
 use tonic::{Code, Status};
 
 /// The only public gateway method on which driver-native credentials apply.
 pub const ISSUE_SANDBOX_TOKEN_PATH: &str = "/openshell.v1.OpenShell/IssueSandboxToken";
+
+/// Return the immutable runtime reference only for the recorded compute driver.
+/// The annotations come from the gateway's persisted driver response.
+pub fn recorded_runtime<'a>(metadata: &'a ObjectMeta, driver_name: &str) -> Option<&'a str> {
+    use crate::compute::{COMPUTE_DRIVER_ANNOTATION, COMPUTE_RUNTIME_IDENTITY_ANNOTATION};
+
+    if metadata
+        .annotations
+        .get(COMPUTE_DRIVER_ANNOTATION)?
+        .as_str()
+        != driver_name
+    {
+        return None;
+    }
+    metadata
+        .annotations
+        .get(COMPUTE_RUNTIME_IDENTITY_ANNOTATION)
+        .map(String::as_str)
+        .filter(|runtime| !runtime.is_empty())
+}
 
 #[derive(Clone, Debug)]
 pub struct ComputeDriverAuthenticator {

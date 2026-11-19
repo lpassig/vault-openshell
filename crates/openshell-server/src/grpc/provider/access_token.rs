@@ -208,7 +208,8 @@ async fn obtain(
     request: Request<GetSandboxProviderAccessTokenRequest>,
     request_id: Option<&str>,
 ) -> Result<Response<GetSandboxProviderAccessTokenResponse>, Status> {
-    let Some(Principal::Sandbox(principal)) = request.extensions().get::<Principal>() else {
+    let Some(caller @ Principal::Sandbox(principal)) = request.extensions().get::<Principal>()
+    else {
         return Err(token_grant_identity_rejected(tonic::Code::PermissionDenied));
     };
     let mut values = request.metadata().get_all("authorization").iter();
@@ -261,6 +262,12 @@ async fn obtain(
                 .await);
         }
         let audience = effective_jwt_svid_audience(&grant.token_endpoint, &grant.jwt_svid_audience);
+        let audit_denial = |_: &Status| {
+            crate::auth::audit::emit_authorization_denial(
+                caller,
+                crate::auth::audit::AuthzDenial::BootstrapAuthorization,
+            );
+        };
         let permit = gate
             .provider_permit(
                 state,
@@ -270,9 +277,12 @@ async fn obtain(
                 &audience,
                 (&configured.provider, grant),
             )
-            .await?;
+            .await
+            .inspect_err(audit_denial)?;
         authorize(state, &bearer).await?;
-        gate.recheck(state, &session, &permit).await?;
+        gate.recheck(state, &session, &permit)
+            .await
+            .inspect_err(audit_denial)?;
         Some(permit)
     } else {
         None

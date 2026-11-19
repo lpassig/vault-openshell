@@ -812,7 +812,13 @@ async fn handle_create_sandbox_inner(
                 &runtime_identity,
                 &device_evidence,
             )
-            .await?,
+            .await
+            .inspect_err(|_| {
+                crate::auth::audit::emit_authorization_denial(
+                    &principal,
+                    crate::auth::audit::AuthzDenial::BootstrapAuthorization,
+                );
+            })?,
         );
     }
     if let Some(metadata) = sandbox.metadata.as_mut() {
