@@ -456,6 +456,9 @@ message GetSandboxRequest {
   string sandbox_id = 1;
   // Compute-runtime name used by the driver.
   string name = 2;
+  // Request a fresh observation of the supervisor before credential activation.
+  // An absent observation provides no evidence, including for older drivers.
+  bool observe_supervisor = 3;
 }
 
 message GetSandboxResponse {
@@ -463,6 +466,19 @@ message GetSandboxResponse {
   DriverSandbox sandbox = 1;
   reserved 2;
   reserved "supervisor_app_endpoint";
+  SupervisorRuntimeObservation supervisor = 3;
+}
+
+// A trusted compute driver observed a live supervisor for these launch
+// coordinates. This describes runtime placement, not caller key possession.
+message SupervisorRuntimeObservation {
+  // The stable sandbox ID the gateway requested.
+  string sandbox_id = 1;
+  // The immutable identity of the running supervisor, not its mutable name.
+  string runtime_identity = 2;
+  // Launch coordinates assigned by the gateway and observed by the driver.
+  string generation = 3;
+  uint64 auth_epoch = 4;
 }
 
 message ResolveSupervisorAppEndpointRequest {

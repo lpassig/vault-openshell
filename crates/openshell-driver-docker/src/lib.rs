@@ -51,10 +51,11 @@ use openshell_core::proto::compute::v1::{
     GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse, GpuResourceCapabilities,
     GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse,
     MemoryResourceCapabilities, ResourceCapabilities, StartSandboxRequest, StartSandboxResponse,
-    StopSandboxRequest, StopSandboxResponse, SuspendSandboxRequest, SuspendSandboxResponse,
-    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
-    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesRequest,
-    WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver, watch_sandboxes_event,
+    StopSandboxRequest, StopSandboxResponse, SupervisorRuntimeObservation, SuspendSandboxRequest,
+    SuspendSandboxResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
+    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesPlatformEvent,
+    WatchSandboxesRequest, WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver,
+    watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
@@ -132,6 +133,8 @@ const LABEL_ISOLATION_BACKEND_OPEN_SHELL: &str = openshell_sandbox_backend::BACK
 const LABEL_ISOLATION_ROLE: &str = "openshell.ai/isolation-role";
 const LABEL_ISOLATION_ROLE_SANDBOX: &str = "sandbox";
 const LABEL_ISOLATION_ROLE_SUPERVISOR: &str = "supervisor";
+const LABEL_SUPERVISOR_GENERATION: &str = "openshell.ai/supervisor-generation";
+const LABEL_SUPERVISOR_AUTH_EPOCH: &str = "openshell.ai/supervisor-auth-epoch";
 const LABEL_ISOLATION_ROLE_STAGING: &str = "staging";
 const LABEL_ISOLATION_ROLE_IDENTITY: &str = "identity";
 const RUNTIME_DESCRIPTOR_FILE: &str = "runtime-descriptor.json";
@@ -3511,6 +3514,11 @@ impl ComputeDriver for DockerComputeDriver {
         let request = request.into_inner();
         require_sandbox_identifier(&request.sandbox_id, &request.name)?;
 
+        if request.observe_supervisor && request.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "supervisor observation requires sandbox_id",
+            ));
+        }
         let sandbox = self
             .get_sandbox_snapshot(&request.sandbox_id, &request.name)
             .await?
@@ -3522,8 +3530,30 @@ impl ComputeDriver for DockerComputeDriver {
             ));
         }
 
+        let supervisor = if request.observe_supervisor {
+            let name = format!("{}-supervisor", container_name_for_sandbox(&sandbox));
+            match self.docker.inspect_container(&name, None).await {
+                Ok(inspected) => observed_docker_supervisor(
+                    &sandbox,
+                    &self.config.supervisor_image_id,
+                    &self.config.sandbox_namespace,
+                    &inspected,
+                ),
+                Err(BollardError::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => None,
+                Err(_) => {
+                    return Err(Status::unavailable(
+                        "Docker supervisor observation unavailable",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         Ok(Response::new(GetSandboxResponse {
             sandbox: Some(sandbox),
+            supervisor,
         }))
     }
 
@@ -5521,17 +5551,12 @@ fn docker_network_trust_supervisor_mount(
     })
 }
 
-/// Read the image identity pinned at provisioning, including after a restart.
+/// Read identity pinned at provisioning, including after a restart.
 /// Re-resolving the template's tag here could identify a different image.
-async fn docker_workload_image_environment(
+fn docker_workload_image_environment(
     sandbox: &DriverSandbox,
-    directory: &Path,
-) -> Result<Vec<String>, Status> {
-    let bytes = tokio::fs::read(directory.join(BOUNDARY_CONFIG_FILE))
-        .await
-        .map_err(|error| Status::internal(format!("read Docker image launch identity: {error}")))?;
-    let bootstrap: BoundaryConfig = serde_json::from_slice(&bytes)
-        .map_err(|_| Status::internal("decode Docker image launch identity"))?;
+    bootstrap: &BoundaryConfig,
+) -> Vec<String> {
     let mut environment = Vec::new();
     if let Some(image) = sandbox_image(sandbox) {
         environment.push(format!(
@@ -5549,7 +5574,47 @@ async fn docker_workload_image_environment(
             openshell_core::sandbox_env::CONTAINER_IMAGE_UID
         ));
     }
-    Ok(environment)
+    environment
+}
+
+fn observed_docker_supervisor(
+    sandbox: &DriverSandbox,
+    supervisor_image_id: &str,
+    namespace: &str,
+    inspected: &bollard::models::ContainerInspectResponse,
+) -> Option<SupervisorRuntimeObservation> {
+    let labels = inspected.config.as_ref()?.labels.as_ref()?;
+    if inspected.state.as_ref()?.running != Some(true)
+        || inspected.image.as_deref() != Some(supervisor_image_id)
+        || labels.get(LABEL_MANAGED_BY)?.as_str() != LABEL_MANAGED_BY_VALUE
+        || labels.get(LABEL_ISOLATION_ROLE)?.as_str() != LABEL_ISOLATION_ROLE_SUPERVISOR
+        || labels.get(LABEL_SANDBOX_ID)? != &sandbox.id
+        || labels.get(LABEL_SANDBOX_NAMESPACE)?.as_str() != namespace
+    {
+        return None;
+    }
+    let id = inspected.id.as_deref()?;
+    if id.len() != 64
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    let generation = openshell_core::sandbox_generation::SandboxGenerationId::parse(
+        labels.get(LABEL_SUPERVISOR_GENERATION)?.as_str(),
+    )
+    .ok()?;
+    let auth_epoch = labels
+        .get(LABEL_SUPERVISOR_AUTH_EPOCH)?
+        .parse::<std::num::NonZeroU64>()
+        .ok()?;
+    Some(SupervisorRuntimeObservation {
+        sandbox_id: sandbox.id.clone(),
+        runtime_identity: format!("docker://{id}"),
+        generation: generation.to_string(),
+        auth_epoch: auth_epoch.get(),
+    })
 }
 
 async fn spawn_docker_control_process(
@@ -5578,7 +5643,12 @@ async fn spawn_docker_control_process(
     let workspace_root = tokio::fs::read_to_string(directory.join(WORKSPACE_ROOT_FILE))
         .await
         .map_err(|error| Status::internal(format!("read Docker workspace root: {error}")))?;
-    let image_environment = docker_workload_image_environment(sandbox, &directory).await?;
+    let launch_bytes = tokio::fs::read(directory.join(BOUNDARY_CONFIG_FILE))
+        .await
+        .map_err(|error| Status::internal(format!("read Docker launch identity: {error}")))?;
+    let launch: BoundaryConfig = serde_json::from_slice(&launch_bytes)
+        .map_err(|_| Status::internal("decode Docker launch identity"))?;
+    let image_environment = docker_workload_image_environment(sandbox, &launch);
     let supervisor_name = format!("{}-supervisor", container_name_for_sandbox(sandbox));
     let _ = docker
         .remove_container(
@@ -5658,6 +5728,11 @@ async fn spawn_docker_control_process(
         (
             LABEL_ISOLATION_ROLE.to_string(),
             LABEL_ISOLATION_ROLE_SUPERVISOR.to_string(),
+        ),
+        (LABEL_SUPERVISOR_GENERATION.to_string(), launch.generation),
+        (
+            LABEL_SUPERVISOR_AUTH_EPOCH.to_string(),
+            launch.auth_epoch.get().to_string(),
         ),
     ]);
     let mut command = vec![

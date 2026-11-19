@@ -6906,6 +6906,7 @@ impl ComputeRuntime {
                             .get_sandbox(Request::new(GetSandboxRequest {
                                 sandbox_id,
                                 name: sandbox_name,
+                                observe_supervisor: false,
                             }))
                             .await
                     }
@@ -9287,6 +9288,7 @@ mod tests {
 
             Ok(tonic::Response::new(GetSandboxResponse {
                 sandbox: Some(sandbox),
+                supervisor: None,
             }))
         }
 
@@ -9823,6 +9825,7 @@ mod tests {
                 ControlledGetOutcome::Sandbox(sandbox) => {
                     Ok(tonic::Response::new(GetSandboxResponse {
                         sandbox: Some(*sandbox),
+                        supervisor: None,
                     }))
                 }
                 ControlledGetOutcome::Missing => Err(Status::not_found("sandbox not found")),
@@ -18480,6 +18483,7 @@ mod tests {
                 .get_sandbox(Request::new(GetSandboxRequest {
                     sandbox_id: sandbox.id.clone(),
                     name: String::new(),
+                    observe_supervisor: false,
                 }))
                 .await
                 .unwrap();

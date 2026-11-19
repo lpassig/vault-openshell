@@ -5374,6 +5374,7 @@ impl ComputeDriver for VmDriver {
 
         Ok(Response::new(GetSandboxResponse {
             sandbox: Some(sandbox),
+            supervisor: None,
         }))
     }
 
@@ -8918,6 +8919,7 @@ mod tests {
                 .get_sandbox(request_with_traceparent(GetSandboxRequest {
                     sandbox_id: String::new(),
                     name: String::new(),
+                    observe_supervisor: false,
                 }))
                 .await
                 .is_err()

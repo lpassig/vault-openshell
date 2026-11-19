@@ -123,6 +123,7 @@ impl ComputeDriver for ComputeDriverService {
                     .ok_or_else(|| Status::not_found("sandbox not found"))?;
                 Ok(Response::new(GetSandboxResponse {
                     sandbox: Some(sandbox),
+                    supervisor: None,
                 }))
             })
             .await

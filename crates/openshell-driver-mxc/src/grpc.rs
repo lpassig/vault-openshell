@@ -93,6 +93,7 @@ impl ComputeDriver for ComputeDriverService {
         }
         Ok(Response::new(GetSandboxResponse {
             sandbox: Some(sandbox),
+            supervisor: None,
         }))
     }
 

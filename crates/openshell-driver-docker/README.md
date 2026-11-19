@@ -276,6 +276,13 @@ For HTTPS endpoints, the supervisor receives only the gateway CA and
 uses its sandbox-scoped bearer token to authenticate RPCs. User client
 certificates and private keys are not delivered to either container.
 
+When the compute driver receives `GetSandbox` with `observe_supervisor`,
+it inspects the running supervisor by sandbox ID and checks the image and
+control-container labels. A successful observation returns the immutable
+Docker container ID, launch generation, and authorization epoch. It describes
+placement under the trusted Docker daemon. Caller identity requires separate
+proof from the supervisor's authenticated connection.
+
 Host mode on Docker Desktop requires host networking enabled in Settings.
 For bridge mode or a gateway endpoint using `host.docker.internal`, the driver
 resolves Docker's `host-gateway` once during initialization and caches it.

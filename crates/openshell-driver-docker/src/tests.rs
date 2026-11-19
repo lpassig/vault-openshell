@@ -25,6 +25,73 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 #[test]
+fn bootstrap_observation_requires_the_live_driver_supervisor() {
+    let sandbox = test_sandbox();
+    let supervisor_id = "a".repeat(64);
+    let labels = HashMap::from([
+        (LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE),
+        (LABEL_ISOLATION_ROLE, LABEL_ISOLATION_ROLE_SUPERVISOR),
+        (LABEL_SANDBOX_ID, sandbox.id.as_str()),
+        (LABEL_SANDBOX_NAMESPACE, "fixture"),
+        (LABEL_SUPERVISOR_GENERATION, "launch-a"),
+        (LABEL_SUPERVISOR_AUTH_EPOCH, "1"),
+    ]);
+    let observation = serde_json::json!({
+        "Id": supervisor_id,
+        "Image": "sha256:supervisor-image",
+        "State": {"Running": true},
+        "Config": {"Labels": labels},
+    });
+    let parse =
+        |value| serde_json::from_value::<bollard::models::ContainerInspectResponse>(value).unwrap();
+    let observed = observed_docker_supervisor(
+        &sandbox,
+        "sha256:supervisor-image",
+        "fixture",
+        &parse(observation.clone()),
+    )
+    .unwrap();
+    assert_eq!(observed.sandbox_id, sandbox.id);
+    assert_eq!(
+        observed.runtime_identity,
+        format!("docker://{supervisor_id}")
+    );
+    assert_eq!(observed.generation, "launch-a");
+    assert_eq!(observed.auth_epoch, 1);
+
+    for (path, replacement) in [
+        ("/State/Running", serde_json::json!(false)),
+        ("/Image", serde_json::json!("sha256:unexpected-image")),
+        (
+            "/Config/Labels/openshell.ai~1isolation-role",
+            serde_json::json!(LABEL_ISOLATION_ROLE_SANDBOX),
+        ),
+        (
+            "/Config/Labels/openshell.ai~1supervisor-generation",
+            serde_json::json!(""),
+        ),
+        (
+            "/Config/Labels/openshell.ai~1supervisor-auth-epoch",
+            serde_json::json!("0"),
+        ),
+        ("/Id", serde_json::json!("supervisor-name")),
+    ] {
+        let mut invalid = observation.clone();
+        *invalid.pointer_mut(path).unwrap() = replacement;
+        assert!(
+            observed_docker_supervisor(
+                &sandbox,
+                "sha256:supervisor-image",
+                "fixture",
+                &parse(invalid)
+            )
+            .is_none(),
+            "{path}"
+        );
+    }
+}
+
+#[test]
 fn startup_error_log_tails_fit_grpc_header_budget() {
     // Multibyte text exercises both the UTF-8 cut and worst-case gRPC message
     // percent encoding. Preserve the supervisor's final diagnostic.
@@ -152,9 +219,7 @@ async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together
     // A restart keeps the original image identity even if the mutable
     // template reference now names another image in the registry.
     let sandbox = test_sandbox();
-    let image_env = docker_workload_image_environment(&sandbox, &directory)
-        .await
-        .unwrap();
+    let image_env = docker_workload_image_environment(&sandbox, &bootstrap);
     assert!(image_env.contains(&format!(
         "{}=image-test",
         openshell_core::sandbox_env::CONTAINER_IMAGE_UID
