@@ -2793,21 +2793,25 @@ async fn report_configuration_admission(
     if state == ConfigurationAdmissionState::Accepted
         && let Some(socket) = std::env::var_os(sandbox_env::BOOTSTRAP_SPIFFE_WORKLOAD_API_SOCKET)
     {
-        return grpc_attempt("SPIFFE configuration admission", async {
-            let identity = openshell_spire::supervisor_tls_identity(std::path::Path::new(&socket))
+        return grpc_attempt(
+            "SPIFFE configuration admission",
+            Box::pin(async {
+                let identity =
+                    openshell_spire::supervisor_tls_identity(std::path::Path::new(&socket))
+                        .await
+                        .map_err(grpc_client::grpc_status_error)?;
+                grpc_client::report_sandbox_configuration_with_identity(
+                    gateway,
+                    sandbox_id,
+                    instance_id,
+                    snapshot,
+                    state,
+                    error,
+                    Some(identity),
+                )
                 .await
-                .map_err(grpc_client::grpc_status_error)?;
-            grpc_client::report_sandbox_configuration_with_identity(
-                gateway,
-                sandbox_id,
-                instance_id,
-                snapshot,
-                state,
-                error,
-                Some(identity),
-            )
-            .await
-        })
+            }),
+        )
         .await;
     }
     grpc_client::report_sandbox_configuration(
