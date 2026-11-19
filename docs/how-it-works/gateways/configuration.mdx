@@ -1721,8 +1721,13 @@ shared supervision), trusted gateway `verification_keys` (objects with
 `private_key_pem`. Use mode `0600` or `0400`. The supervisor rejects symlinks
 and reads the file when a provider request needs it. The posture authority
 must independently enroll the matching public key for the verified host
-and assignment. Provisioning and proof-bound renewal are external to this
-transport integration.
+and assignment. The shared supervisor uses the same enrolled key and fresh
+posture checks to renew the gateway and Sandbox Protocol JWTs. The posture
+authority must handle the `renewal` stage. Each renewal proof is single-use
+and bound to that operation. Renewed JWTs retain bootstrap scopes and expire
+within 30 seconds. Revoking the launch admission blocks subsequent gateway
+requests made with renewed JWTs. Provision the enrollment files before the
+initial JWT expires.
 
 On Docker, set `docker_spiffe_id_prefix` in the bootstrap authorization table,
 for example `"spiffe://example.org/openshell"`. Use `config_delivery_mode = "poll"`
@@ -1744,12 +1749,11 @@ an authorized policy which the supervisor can apply directly, and leave
 provider attachments empty. Restart the gateway when you change the SPIFFE
 client CA bundle.
 
-The initial slice rejects session renewal, extension credential issuance,
+Enabled mode rejects Docker session renewal, extension credential issuance,
 credential-bearing configuration snapshots, and legacy intermediate-exchange
-requests while enabled. The Kubernetes provider-token path bypasses its cache. Real adapters must
-verify fresh requester and host posture, runtime/key binding and trusted SPIRE
-selector facts; they must also revalidate sandbox authorization. This is an
-integration slice, not a production-ready deployment mode.
+requests. The Kubernetes provider-token path bypasses its cache. Production
+deployments need a posture authority that verifies requester and host posture,
+runtime and key binding, and trusted SPIRE selector facts.
 
 ### MXC
 
