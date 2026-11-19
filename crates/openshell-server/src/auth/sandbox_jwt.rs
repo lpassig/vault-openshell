@@ -401,7 +401,10 @@ impl Authenticator for SandboxSessionJwtAuthenticator {
         }
         let authenticated = self.authority.verify_gateway_token(token)?;
         if let Some(grant) = &authenticated.bootstrap {
-            if !bootstrap_callable(path) {
+            if !(bootstrap_callable(path)
+                || (grant.intent.driver == "docker"
+                    && path == "/openshell.v1.OpenShell/GetSandboxProviderEnvironment"))
+            {
                 return Err(AuthRejection::new(
                     AuthMechanism::SandboxJwt,
                     AuthFailureReason::InvalidCredential,

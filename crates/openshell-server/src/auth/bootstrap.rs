@@ -14,8 +14,12 @@ use openshell_core::bootstrap_authz::{
 };
 use openshell_core::config::Config;
 use openshell_core::jwt::AuthenticatedSandboxSession;
-use openshell_core::proto::{Provider, ProviderCredentialTokenGrant, Sandbox};
+use openshell_core::proto::{
+    Provider, ProviderCredentialTokenGrant, Sandbox, SandboxConfigurationAdmission,
+};
+use openshell_crypto::tls::spiffe::{SpiffeClientVerifier, VerifiedSpiffeClient};
 use openshell_spiffe::SandboxSpiffeIdPrefix;
+use rustls::pki_types::UnixTime;
 use serde::Serialize;
 use tonic::Status;
 
@@ -28,6 +32,16 @@ const GRANT_TYPE: &str = "bootstrap_authorization_grant";
 const PROOF_TYPE: &str = "bootstrap_authorization_proof";
 pub const PROOF_HEADER: &str = "x-openshell-workload-proof";
 pub const DEVICE_HEADER: &str = "x-openshell-device-evidence";
+pub const ACTIVATION_ANNOTATION: &str = "internal.openshell.ai/bootstrap-activation";
+
+#[derive(Serialize)]
+struct ConfigurationActivation<'a> {
+    decision: Grant,
+    admission_decision_id: &'a str,
+    gateway_token_id: String,
+    configuration_fence: String,
+    spiffe_id: String,
+}
 
 pub struct PersistentDecisionStore(pub Arc<Store>);
 
@@ -72,6 +86,7 @@ pub struct BootstrapRuntime {
     gateway_id: String,
     prefix: SandboxSpiffeIdPrefix,
     store: Arc<Store>,
+    docker_verifier: Option<SpiffeClientVerifier>,
 }
 
 impl std::fmt::Debug for BootstrapRuntime {
@@ -91,9 +106,10 @@ impl BootstrapRuntime {
         else {
             return Ok(None);
         };
-        if config.tls.is_none() {
-            return Err("bootstrap_authorization requires gateway TLS".into());
-        }
+        let tls = config
+            .tls
+            .as_ref()
+            .ok_or("bootstrap_authorization requires gateway TLS")?;
         let jwt = config
             .gateway_jwt
             .as_ref()
@@ -101,10 +117,38 @@ impl BootstrapRuntime {
         if jwt.ttl_secs.is_none() {
             return Err("bootstrap_authorization requires positive gateway JWT TTL".into());
         }
-        let broker = config
-            .spiffe_broker
-            .as_ref()
-            .ok_or("bootstrap_authorization requires spiffe_broker")?;
+        let (prefix, docker_verifier) = if let Some(raw) = &settings.docker_spiffe_id_prefix {
+            if config.compute_driver.as_deref() != Some("docker")
+                || config.config_delivery_mode != openshell_core::config::ConfigDeliveryMode::Poll
+                || config.spiffe_broker.is_some()
+                || config.mtls_auth.enabled
+                || config.mtls_auth.operator_enabled
+                || tls.require_client_auth
+            {
+                return Err("Docker bootstrap activation requires the Docker driver, polling, and optional TLS client certificates dedicated to SPIFFE".into());
+            }
+            let path = tls
+                .client_ca_path
+                .as_ref()
+                .ok_or("Docker bootstrap activation requires a SPIFFE client CA bundle")?;
+            let verifier = SpiffeClientVerifier::new(
+                openshell_spiffe::trust_domain(raw)
+                    .ok_or("invalid Docker SPIFFE trust domain")?
+                    .into(),
+                load_client_roots(path)?,
+            )
+            .map_err(|error| error.to_string())?;
+            (SandboxSpiffeIdPrefix::parse(raw)?, Some(verifier))
+        } else {
+            let broker = config
+                .spiffe_broker
+                .as_ref()
+                .ok_or("bootstrap_authorization requires spiffe_broker")?;
+            (
+                SandboxSpiffeIdPrefix::parse(&broker.spiffe_id_prefix)?,
+                None,
+            )
+        };
         if !(1..=10_000).contains(&settings.timeout_ms)
             || !settings.opa_executable.is_absolute()
             || !settings.opa_executable.is_file()
@@ -125,8 +169,9 @@ impl BootstrapRuntime {
         Ok(Some(Arc::new(Self {
             gate,
             gateway_id: jwt.gateway_id.clone(),
-            prefix: SandboxSpiffeIdPrefix::parse(&broker.spiffe_id_prefix)?,
+            prefix,
             store,
+            docker_verifier,
         })))
     }
 
@@ -137,7 +182,25 @@ impl BootstrapRuntime {
             gateway_id: "gateway-a".into(),
             prefix: SandboxSpiffeIdPrefix::parse("spiffe://example.org/openshell").unwrap(),
             store,
+            docker_verifier: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_docker_verifier(mut self, verifier: SpiffeClientVerifier) -> Self {
+        self.docker_verifier = Some(verifier);
+        self
+    }
+
+    pub fn docker_activation_enabled(&self) -> bool {
+        self.docker_verifier.is_some()
+    }
+
+    pub fn tls_peer(&self, connection: &rustls::ServerConnection) -> Option<VerifiedSpiffeClient> {
+        self.docker_verifier
+            .as_ref()?
+            .verify_peer(connection, UnixTime::now())
+            .ok()
     }
 
     /// The caller already passed workspace create authorization and canonical policy validation.
@@ -149,6 +212,9 @@ impl BootstrapRuntime {
         identity: &super::sandbox_session::PersistedSandboxIdentity,
         device_evidence: &str,
     ) -> Result<Grant, Status> {
+        if self.docker_activation_enabled() {
+            Self::require_credential_free(sandbox)?;
+        }
         let owner = principal
             .user_identity()
             .filter(|i| i.provider != super::identity::IdentityProvider::LocalDev)
@@ -186,6 +252,132 @@ impl BootstrapRuntime {
             .await
             .map_err(|_| status(Denial::ReplayOrPersistence))?;
         Ok(grant)
+    }
+
+    pub fn require_credential_free(sandbox: &Sandbox) -> Result<(), Status> {
+        if sandbox
+            .spec
+            .as_ref()
+            .is_none_or(|spec| !spec.providers.is_empty())
+        {
+            return Err(Status::permission_denied(
+                "Docker bootstrap activation does not deliver provider credentials",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Called after normal configuration admission checks. The caller commits
+    /// this decision with the accepted configuration using the same CAS.
+    pub async fn authorize_docker_configuration<T>(
+        &self,
+        state: &ServerState,
+        request: &tonic::Request<T>,
+        sandbox: &Sandbox,
+        admission: &SandboxConfigurationAdmission,
+    ) -> Result<String, Status> {
+        Self::require_credential_free(sandbox)?;
+        let mut bearers = request.metadata().get_all("authorization").iter();
+        let bearer = bearers
+            .next()
+            .and_then(|value| value.to_str().ok())
+            .and_then(openshell_core::auth::strip_bearer_scheme)
+            .ok_or_else(|| status(Denial::MissingSignal))?;
+        if bearers.next().is_some() {
+            return Err(status(Denial::IdentityMismatch));
+        }
+        let authority = state
+            .sandbox_session_jwt_authority
+            .as_ref()
+            .ok_or_else(|| status(Denial::Unavailable))?;
+        let session = authority
+            .verify_gateway_token(bearer)
+            .map_err(|error| error.status)?;
+        if session.sandbox_id.as_str() != sandbox.object_id() {
+            return Err(status(Denial::IdentityMismatch));
+        }
+        super::sandbox_session::authorize_persisted(&state.store, &session)
+            .await
+            .map_err(|error| error.status)?;
+        let grant = session
+            .bootstrap
+            .as_ref()
+            .ok_or_else(|| status(Denial::MissingSignal))?;
+        self.verify_grant(grant).await?;
+        let intent = self
+            .intent(
+                state,
+                sandbox,
+                &grant.intent.owner,
+                session.runtime_generation.as_str(),
+                session.auth_epoch.get(),
+                None,
+            )
+            .await?;
+        let read_observation = || async {
+            tokio::time::timeout(self.gate.timeout, state.compute.observe_supervisor(sandbox))
+                .await
+                .map_err(|_| status(Denial::Timeout))?
+        };
+        let observation = read_observation().await?;
+        let peer = request.extensions().get::<VerifiedSpiffeClient>();
+        let configuration_fence = canonical_digest(&(
+            &admission.instance_id,
+            admission.policy_version,
+            &admission.policy_hash,
+            admission.config_revision,
+            admission.provider_env_revision,
+        ))?;
+        let decision = self
+            .gate
+            .activate_docker(
+                grant,
+                &intent,
+                &observation,
+                peer,
+                &configuration_fence,
+                now(),
+            )
+            .await
+            .map_err(status)?;
+        let spiffe_id =
+            openshell_core::bootstrap_authz::docker_supervisor_spiffe_id(&intent, &observation)
+                .map_err(status)?;
+        if read_observation().await? != observation {
+            return Err(status(Denial::IdentityMismatch));
+        }
+        super::sandbox_session::authorize_persisted(&state.store, &session)
+            .await
+            .map_err(|error| error.status)?;
+        if self
+            .intent(
+                state,
+                sandbox,
+                &grant.intent.owner,
+                session.runtime_generation.as_str(),
+                session.auth_epoch.get(),
+                None,
+            )
+            .await?
+            != intent
+        {
+            return Err(status(Denial::IdentityMismatch));
+        }
+        self.verify_grant(grant).await?;
+        authority
+            .verify_gateway_token(bearer)
+            .map_err(|error| error.status)?;
+        if decision.expires_at <= now() {
+            return Err(status(Denial::StaleEvidence));
+        }
+        serde_json::to_string(&ConfigurationActivation {
+            decision,
+            admission_decision_id: &grant.decision_id,
+            gateway_token_id: session.token_id.to_string(),
+            configuration_fence,
+            spiffe_id,
+        })
+        .map_err(|_| status(Denial::ReplayOrPersistence))
     }
 
     pub async fn verify_grant(&self, grant: &Grant) -> Result<(), Status> {
@@ -466,6 +658,14 @@ pub async fn verify_persisted_grant(store: &Store, grant: &Grant) -> Result<(), 
         return Err(status(Denial::StaleEvidence));
     }
     Ok(())
+}
+
+fn load_client_roots(path: &std::path::Path) -> Result<rustls::RootCertStore, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in crate::tls::load_certs(path).map_err(|error| error.to_string())? {
+        roots.add(cert).map_err(|error| error.to_string())?;
+    }
+    Ok(roots)
 }
 
 fn canonical_digest(value: &impl Serialize) -> Result<String, Status> {

@@ -274,6 +274,9 @@ pub struct BootstrapAuthorizationConfig {
     pub enabled: bool,
     pub opa_executable: PathBuf,
     pub timeout_ms: u64,
+    /// Enables the Docker polling activation prototype with this SPIFFE prefix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker_spiffe_id_prefix: Option<String>,
 }
 
 impl Default for BootstrapAuthorizationConfig {
@@ -282,6 +285,7 @@ impl Default for BootstrapAuthorizationConfig {
             enabled: false,
             opa_executable: PathBuf::from("opa"),
             timeout_ms: 2000,
+            docker_spiffe_id_prefix: None,
         }
     }
 }

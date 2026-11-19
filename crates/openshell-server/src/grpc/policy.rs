@@ -3950,6 +3950,16 @@ pub async fn build_provider_environment_snapshot_from_inputs(
     supports_stable_placeholder_environment_keys: bool,
 ) -> Result<ProviderEnvironmentSnapshot, Status> {
     if let Some(gate) = &state.bootstrap_authorization {
+        if gate.docker_activation_enabled() {
+            crate::auth::bootstrap::BootstrapRuntime::require_credential_free(&inputs.sandbox)?;
+            let config = build_sandbox_config_snapshot_from_inputs(state, inputs).await?;
+            return Ok(ProviderEnvironmentSnapshot {
+                provider_env_revision: config.provider_env_revision,
+                provider_attachment_epoch: config.provider_attachment_epoch,
+                policy_hash: config.policy_hash,
+                ..Default::default()
+            });
+        }
         return Err(gate
             .reject(inputs.sandbox.object_id(), "provider_environment")
             .await);
@@ -5081,7 +5091,7 @@ pub(super) async fn handle_report_sandbox_configuration(
 ) -> Result<Response<openshell_core::proto::ReportSandboxConfigurationResponse>, Status> {
     use openshell_core::proto::ConfigurationAdmissionState;
     let sandbox_id = request.get_ref().sandbox_id.clone();
-    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
+    let principal = crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
     let mut admission = request
         .get_ref()
         .admission
@@ -5197,6 +5207,27 @@ pub(super) async fn handle_report_sandbox_configuration(
         .metadata
         .as_ref()
         .map_or(0, |metadata| metadata.resource_version);
+    let docker_activation = state
+        .bootstrap_authorization
+        .as_ref()
+        .filter(|runtime| runtime.docker_activation_enabled());
+    let activation = if let Some(runtime) = docker_activation
+        && reported == ConfigurationAdmissionState::Accepted
+    {
+        Some(
+            runtime
+                .authorize_docker_configuration(state, &request, &sandbox, &admission)
+                .await
+                .inspect_err(|_| {
+                    crate::auth::audit::emit_authorization_denial(
+                        &principal,
+                        crate::auth::audit::AuthzDenial::BootstrapAuthorization,
+                    );
+                })?,
+        )
+    } else {
+        None
+    };
     let now_ms = current_time_ms();
     let mut provisioning = sandbox
         .status
@@ -5229,6 +5260,18 @@ pub(super) async fn handle_report_sandbox_configuration(
     let updated = state
         .store
         .update_message_cas::<Sandbox, _>(&sandbox_id, expected_version, |sandbox| {
+            if docker_activation.is_some()
+                && let Some(metadata) = sandbox.metadata.as_mut()
+            {
+                use crate::auth::bootstrap::ACTIVATION_ANNOTATION;
+                if let Some(activation) = &activation {
+                    metadata
+                        .annotations
+                        .insert(ACTIVATION_ANNOTATION.into(), activation.clone());
+                } else {
+                    metadata.annotations.remove(ACTIVATION_ANNOTATION);
+                }
+            }
             sandbox
                 .status
                 .get_or_insert_with(Default::default)

@@ -1621,22 +1621,8 @@ fn spawn_gateway_connection(
                     // the full duration of the handshake.
                     match acceptor.acceptor().accept(stream).await {
                         Ok(tls_stream) => {
-                            let peer_identity = multiplex::extract_peer_identity(&tls_stream);
-                            let certificate_sha256 =
-                                match multiplex::extract_peer_certificate_sha256(&tls_stream) {
-                                    Ok(fingerprint) => fingerprint,
-                                    Err(e) => {
-                                        error!(error = %e, client = %addr, "Failed to fingerprint peer certificate");
-                                        return;
-                                    }
-                                };
                             if let Err(e) = service
-                                .serve_with_verified_certificate(
-                                    tls_stream,
-                                    peer_identity,
-                                    certificate_sha256,
-                                    ConnectionSource::Peer(addr),
-                                )
+                                .serve_tls(tls_stream, ConnectionSource::Peer(addr))
                                 .await
                             {
                                 if is_benign_connection_close(e.as_ref()) {

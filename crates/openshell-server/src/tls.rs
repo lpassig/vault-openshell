@@ -463,7 +463,7 @@ fn build_server_config(
 }
 
 /// Load certificates from a PEM file.
-fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
+pub(crate) fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     let file =
         File::open(path).map_err(|e| Error::tls(format!("failed to open cert file: {e}")))?;
     let mut reader = BufReader::new(file);

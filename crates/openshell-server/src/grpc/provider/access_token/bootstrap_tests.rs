@@ -188,10 +188,10 @@ impl BootstrapAuthorizer for AllowPolicy {
             allow: true,
             reason: "fixture_allowed".into(),
             ttl_secs: 60,
-            scopes: BTreeSet::from([if req.stage == Stage::Bootstrap {
-                BOOTSTRAP_CAPABILITY
-            } else {
-                PROVIDER_CAPABILITY
+            scopes: BTreeSet::from([match req.stage {
+                Stage::Bootstrap => BOOTSTRAP_CAPABILITY,
+                Stage::Activation => ACTIVATION_CAPABILITY,
+                Stage::Provider => PROVIDER_CAPABILITY,
             }
             .into()]),
         })
@@ -203,6 +203,300 @@ impl Drop for AbortServer {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+#[tokio::test]
+async fn bootstrap_docker_configuration_requires_the_live_mtls_supervisor() {
+    use crate::auth::bootstrap::{
+        ACTIVATION_ANNOTATION, BootstrapRuntime, PersistentDecisionStore,
+    };
+    use crate::auth::sandbox_jwt::SandboxSessionJwtAuthority;
+    use crate::auth::sandbox_session::PersistedSandboxIdentity;
+    use crate::compute::NoopTestDriver;
+    use crate::multiplex::MultiplexService;
+    use compute::v1::SupervisorRuntimeObservation;
+    use open_shell_client::OpenShellClient;
+    use openshell_crypto::tls::spiffe::SpiffeClientVerifier;
+    use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
+
+    let sandbox_id = "sandbox-a";
+    let mut identity = PersistedSandboxIdentity::new().unwrap();
+    let observation = SupervisorRuntimeObservation {
+        sandbox_id: sandbox_id.into(),
+        runtime_identity: format!("docker://{}", "a".repeat(64)),
+        generation: identity.runtime_generation.as_str().into(),
+        auth_epoch: identity.auth_epoch.get(),
+    };
+    let driver = Arc::new(NoopTestDriver::with_supervisor_observation(
+        observation.clone(),
+    ));
+    let mut state =
+        crate::grpc::test_support::test_server_state_with_compute_driver("docker", driver).await;
+    let directory = tempfile::tempdir().unwrap();
+    let (ca, ca_key) = crate::tls_test_utils::generate_test_certs_with_ca(directory.path());
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.der().clone()).unwrap();
+    let verifier = SpiffeClientVerifier::new("example.org".into(), roots).unwrap();
+    let material = openshell_bootstrap::jwt::generate_jwt_key().unwrap();
+    let authority = Arc::new(
+        SandboxSessionJwtAuthority::from_pem(
+            material.signing_key_pem.as_bytes(),
+            material.public_key_pem.as_bytes(),
+            material.kid,
+            "gateway-a",
+            Some(Duration::from_mins(1)),
+        )
+        .unwrap(),
+    );
+    authority.require_bootstrap_authorization();
+    let revoked = Arc::new(AtomicBool::new(false));
+    let gate = BootstrapGate {
+        authorizer: Arc::new(AllowPolicy),
+        device: Arc::new(MockDevice {
+            public_key: Vec::new(),
+            revoked: revoked.clone(),
+        }),
+        sandbox_authorization: Arc::new(MockSandboxAuthorization),
+        proof: Arc::new(JwtWorkloadProofVerifier),
+        store: Arc::new(PersistentDecisionStore(state.store.clone())),
+        timeout: Duration::from_secs(5),
+    };
+    let runtime = Arc::new(
+        BootstrapRuntime::with_test_gate(state.store.clone(), gate)
+            .with_test_docker_verifier(verifier),
+    );
+    let state_mut = Arc::get_mut(&mut state).unwrap();
+    state_mut.config.config_delivery_mode = openshell_core::config::ConfigDeliveryMode::Poll;
+    state_mut.sandbox_session_jwt_authority = Some(authority.clone());
+    state_mut.bootstrap_authorization = Some(runtime.clone());
+    let mut sandbox = Sandbox {
+        metadata: Some(ObjectMeta {
+            id: sandbox_id.into(),
+            name: sandbox_id.into(),
+            workspace: "default".into(),
+            ..Default::default()
+        }),
+        spec: Some(SandboxSpec {
+            policy: Some(openshell_policy::restrictive_default_policy()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    sandbox.set_phase(SandboxPhase::Ready.into());
+    let principal = Principal::User(crate::auth::principal::UserPrincipal {
+        identity: crate::auth::identity::Identity {
+            subject: "user-a".into(),
+            display_name: None,
+            roles: vec![],
+            scopes: vec![],
+            provider: crate::auth::identity::IdentityProvider::Oidc,
+        },
+    });
+    let grant = runtime
+        .admit(
+            &state,
+            &principal,
+            &sandbox,
+            &identity,
+            "test-device-session",
+        )
+        .await
+        .unwrap();
+    let expected_spiffe = docker_supervisor_spiffe_id(&grant.intent, &observation).unwrap();
+    identity.bootstrap = Some(grant.clone());
+    let annotations = &mut sandbox.metadata.as_mut().unwrap().annotations;
+    identity.write(annotations);
+    annotations.insert(
+        crate::compute::COMPUTE_DRIVER_ANNOTATION.into(),
+        "docker".into(),
+    );
+    annotations.insert(
+        crate::compute::COMPUTE_RUNTIME_IDENTITY_ANNOTATION.into(),
+        observation.runtime_identity.clone(),
+    );
+    state.store.put_message(&sandbox).await.unwrap();
+    let launch = authority
+        .mint_persisted_launch(sandbox_id, &identity)
+        .unwrap();
+    let bearer = format!("Bearer {}", launch.supervisor.gateway_token.expose_secret());
+    let authenticate = |metadata: &mut tonic::metadata::MetadataMap| {
+        metadata.insert("authorization", bearer.parse().unwrap());
+    };
+
+    let acceptor = crate::TlsAcceptor::from_files(
+        &directory.path().join("server-cert.pem"),
+        &directory.path().join("server-key.pem"),
+        Some(&directory.path().join("ca.pem")),
+        false,
+        None,
+        None,
+        vec![],
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let service = MultiplexService::new(state.clone());
+    let _server = AbortServer(tokio::spawn(async move {
+        loop {
+            let (stream, peer) = listener.accept().await.unwrap();
+            openshell_core::net::set_tcp_nodelay_best_effort(&stream);
+            let service = service.clone();
+            let acceptor = acceptor.acceptor();
+            tokio::spawn(async move {
+                let stream = acceptor.accept(stream).await.unwrap();
+                let _ = service
+                    .serve_tls(stream, crate::auth::audit::ConnectionSource::Peer(peer))
+                    .await;
+            });
+        }
+    }));
+    let connect = |spiffe: Option<&str>| {
+        let mut tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(ca.pem()))
+            .domain_name("localhost");
+        if let Some(id) = spiffe {
+            let mut params = rcgen::CertificateParams::default();
+            params.subject_alt_names = vec![rcgen::SanType::URI(id.try_into().unwrap())];
+            params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+            params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+            let key = openshell_crypto::pki::generate_keypair().unwrap();
+            let cert = openshell_crypto::pki::signed_by(params, &key, &ca, &ca_key).unwrap();
+            tls = tls.identity(Identity::from_pem(cert.pem(), key.serialize_pem().unwrap()));
+        }
+        async move {
+            OpenShellClient::new(
+                Endpoint::from_shared(format!("https://localhost:{}", address.port()))
+                    .unwrap()
+                    .tls_config(tls)
+                    .unwrap()
+                    .connect()
+                    .await
+                    .unwrap(),
+            )
+        }
+    };
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    let report = |admission| {
+        let mut request = Request::new(ReportSandboxConfigurationRequest {
+            sandbox_id: sandbox_id.into(),
+            admission: Some(admission),
+            expected_instance_id: String::new(),
+        });
+        authenticate(request.metadata_mut());
+        request
+    };
+    let mut bearer_only = connect(None).await;
+    bearer_only
+        .report_sandbox_configuration(report(SandboxConfigurationAdmission {
+            instance_id: instance_id.clone(),
+            state: ConfigurationAdmissionState::Pending.into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let mut request = Request::new(GetSandboxConfigRequest {
+        name: sandbox_id.into(),
+        workspace_scope: Some(workspace_selector("default")),
+    });
+    authenticate(request.metadata_mut());
+    let config = bearer_only
+        .get_sandbox_config(request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(config.configuration_admitted);
+    let accepted = SandboxConfigurationAdmission {
+        instance_id,
+        state: ConfigurationAdmissionState::Accepted.into(),
+        policy_version: config.version,
+        policy_hash: config.policy_hash,
+        config_revision: config.config_revision,
+        provider_env_revision: config.provider_env_revision,
+        error: String::new(),
+    };
+    let wrong_container = expected_spiffe.replace(&"a".repeat(64), &"b".repeat(64));
+    let wrong_generation = expected_spiffe.replace(&observation.generation, "old-generation");
+    for mut client in [
+        bearer_only,
+        connect(Some(&wrong_container)).await,
+        connect(Some(&wrong_generation)).await,
+    ] {
+        let error = client
+            .report_sandbox_configuration(report(accepted.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied, "{error}");
+        let stored = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !stored
+                .metadata
+                .unwrap()
+                .annotations
+                .contains_key(ACTIVATION_ANNOTATION)
+        );
+        assert_ne!(stored.status.unwrap().configuration_activated, Some(true));
+    }
+
+    let mut client = connect(Some(&expected_spiffe)).await;
+    revoked.store(true, Ordering::Release);
+    assert_eq!(
+        client
+            .report_sandbox_configuration(report(accepted.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    revoked.store(false, Ordering::Release);
+    client
+        .report_sandbox_configuration(report(accepted))
+        .await
+        .unwrap();
+    let stored = state
+        .store
+        .get_message::<Sandbox>(sandbox_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status.unwrap().configuration_activated, Some(true));
+    let metadata = stored.metadata.unwrap();
+    let activation: serde_json::Value =
+        serde_json::from_str(&metadata.annotations[ACTIVATION_ANNOTATION]).unwrap();
+    assert_eq!(activation["spiffe_id"], expected_spiffe);
+    assert_eq!(activation["admission_decision_id"], grant.decision_id);
+    assert_eq!(
+        activation["decision"]["scopes"],
+        serde_json::json!([ACTIVATION_CAPABILITY])
+    );
+    assert!(activation["decision"]["expires_at"].as_i64().unwrap() <= grant.expires_at);
+    let mut request = Request::new(GetSandboxProviderEnvironmentRequest {
+        sandbox_id: sandbox_id.into(),
+        ..Default::default()
+    });
+    authenticate(request.metadata_mut());
+    let provider = client
+        .get_sandbox_provider_environment(request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(provider.environment.is_empty());
+    assert!(provider.dynamic_credentials.is_empty());
+    let mut request = Request::new(GetSandboxProviderAccessTokenRequest {
+        credential_key: "fixture-key".into(),
+    });
+    authenticate(request.metadata_mut());
+    assert!(
+        client
+            .get_sandbox_provider_access_token(request)
+            .await
+            .is_err(),
+        "configuration activation must confer no provider access"
+    );
 }
 
 struct Fixture {

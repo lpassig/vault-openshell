@@ -275,6 +275,46 @@ impl MultiplexService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        self.serve_verified_connection(stream, peer_identity, certificate_sha256, None, source)
+            .await
+    }
+
+    pub async fn serve_tls<S>(
+        &self,
+        stream: tokio_rustls::server::TlsStream<S>,
+        source: ConnectionSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let peer_identity = extract_peer_identity(&stream);
+        let certificate_sha256 = extract_peer_certificate_sha256(&stream)?;
+        let workload_peer = self
+            .state
+            .bootstrap_authorization
+            .as_ref()
+            .and_then(|runtime| runtime.tls_peer(stream.get_ref().1));
+        self.serve_verified_connection(
+            stream,
+            peer_identity,
+            certificate_sha256,
+            workload_peer,
+            source,
+        )
+        .await
+    }
+
+    async fn serve_verified_connection<S>(
+        &self,
+        stream: S,
+        peer_identity: Option<Identity>,
+        certificate_sha256: Option<String>,
+        workload_peer: Option<openshell_crypto::tls::spiffe::VerifiedSpiffeClient>,
+        source: ConnectionSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let operator = if self.state.config.mtls_auth.operator_enabled {
             peer_identity
                 .as_ref()
@@ -343,6 +383,7 @@ impl MultiplexService {
             self.state.config.auth.allow_unauthenticated_users,
         )
         .with_peer_certificate(certificate_sha256)
+        .with_workload_peer(workload_peer)
         .with_operator(operator)
         .with_connection_source(source)
         .with_logons(self.state.logons.clone());
@@ -1190,6 +1231,7 @@ pub struct AuthGrpcRouter<S> {
     /// mTLS peer identity extracted from the TLS handshake.
     peer_identity: Option<Identity>,
     peer_certificate_sha256: Option<String>,
+    workload_peer: Option<openshell_crypto::tls::spiffe::VerifiedSpiffeClient>,
     mtls_auth_enabled: bool,
     allow_unauthenticated_users: bool,
     operator: Option<OperatorPrincipal>,
@@ -1221,6 +1263,7 @@ impl<S> AuthGrpcRouter<S> {
             authz_policy,
             peer_identity,
             peer_certificate_sha256: None,
+            workload_peer: None,
             mtls_auth_enabled,
             allow_unauthenticated_users,
             operator: None,
@@ -1243,6 +1286,14 @@ impl<S> AuthGrpcRouter<S> {
     /// authenticated `peer_identity`.
     fn with_peer_certificate(mut self, certificate_sha256: Option<String>) -> Self {
         self.peer_certificate_sha256 = certificate_sha256;
+        self
+    }
+
+    fn with_workload_peer(
+        mut self,
+        peer: Option<openshell_crypto::tls::spiffe::VerifiedSpiffeClient>,
+    ) -> Self {
+        self.workload_peer = peer;
         self
     }
 
@@ -1294,6 +1345,7 @@ where
         let connection_source = self.connection_source;
         let logons = self.logons.clone();
         let peer_certificate_sha256 = self.peer_certificate_sha256.clone();
+        let workload_peer = self.workload_peer.clone();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -1455,6 +1507,9 @@ where
                     path: path.clone(),
                 };
                 req.extensions_mut().insert(recheck);
+            }
+            if let Some(peer) = workload_peer {
+                req.extensions_mut().insert(peer);
             }
             req.extensions_mut().insert(principal.clone());
             let call = inner.ready().await?.call(req);

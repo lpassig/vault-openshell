@@ -6893,6 +6893,29 @@ impl ComputeRuntime {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<Option<DriverSandbox>, String> {
+        Ok(self
+            .driver_sandbox_response(sandbox_id, sandbox_name, false)
+            .await?
+            .and_then(|response| response.sandbox))
+    }
+
+    pub async fn observe_supervisor(
+        &self,
+        sandbox: &Sandbox,
+    ) -> Result<openshell_core::proto::compute::v1::SupervisorRuntimeObservation, Status> {
+        self.driver_sandbox_response(sandbox.object_id(), sandbox.object_name(), true)
+            .await
+            .map_err(|_| Status::unavailable("supervisor runtime observation unavailable"))?
+            .and_then(|response| response.sandbox.and(response.supervisor))
+            .ok_or_else(|| Status::permission_denied("supervisor runtime observation is required"))
+    }
+
+    async fn driver_sandbox_response(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        observe_supervisor: bool,
+    ) -> Result<Option<openshell_core::proto::compute::v1::GetSandboxResponse>, String> {
         match self
             .driver
             .call(
@@ -6906,7 +6929,7 @@ impl ComputeRuntime {
                             .get_sandbox(Request::new(GetSandboxRequest {
                                 sandbox_id,
                                 name: sandbox_name,
-                                observe_supervisor: false,
+                                observe_supervisor,
                             }))
                             .await
                     }
@@ -6915,8 +6938,8 @@ impl ComputeRuntime {
             .await
         {
             Ok(response) => {
-                let sandbox = response.into_inner().sandbox;
-                if let Some(sandbox) = sandbox.as_ref() {
+                let response = response.into_inner();
+                if let Some(sandbox) = response.sandbox.as_ref() {
                     if sandbox.id != sandbox_id {
                         return Err(format!(
                             "compute driver returned sandbox '{}' for requested id '{sandbox_id}'",
@@ -6925,7 +6948,7 @@ impl ComputeRuntime {
                     }
                     validate_driver_sandbox_timestamps(sandbox)?;
                 }
-                Ok(sandbox)
+                Ok(Some(response))
             }
             Err(status) if status.code() == Code::NotFound => Ok(None),
             Err(status) => Err(status.to_string()),
@@ -8464,6 +8487,8 @@ pub struct NoopTestDriver {
     app_endpoint: Option<openshell_core::proto::compute::v1::SupervisorAppEndpoint>,
     workspace_delete_failures: std::sync::atomic::AtomicUsize,
     sandbox_authentication: Option<Result<(String, String), (Code, String)>>,
+    supervisor_observation:
+        Option<openshell_core::proto::compute::v1::SupervisorRuntimeObservation>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -8481,18 +8506,16 @@ impl NoopTestDriver {
     #[cfg(test)]
     pub fn failing_workspace_deletes(count: usize) -> Self {
         Self {
-            app_endpoint: None,
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(count),
-            sandbox_authentication: None,
+            ..Self::default()
         }
     }
 
     #[cfg(test)]
     pub fn authenticating_sandbox(sandbox_id: impl Into<String>) -> Self {
         Self {
-            app_endpoint: None,
-            workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
             sandbox_authentication: Some(Ok((sandbox_id.into(), "test-runtime".to_string()))),
+            ..Self::default()
         }
     }
 
@@ -8502,18 +8525,26 @@ impl NoopTestDriver {
         runtime_identity: impl Into<String>,
     ) -> Self {
         Self {
-            app_endpoint: None,
-            workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
             sandbox_authentication: Some(Ok((sandbox_id.into(), runtime_identity.into()))),
+            ..Self::default()
         }
     }
 
     #[cfg(test)]
     pub fn failing_sandbox_authentication(code: Code, message: impl Into<String>) -> Self {
         Self {
-            app_endpoint: None,
-            workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
             sandbox_authentication: Some(Err((code, message.into()))),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_supervisor_observation(
+        observation: openshell_core::proto::compute::v1::SupervisorRuntimeObservation,
+    ) -> Self {
+        Self {
+            supervisor_observation: Some(observation),
+            ..Self::default()
         }
     }
 }
@@ -8525,6 +8556,7 @@ impl Default for NoopTestDriver {
             app_endpoint: None,
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
             sandbox_authentication: None,
+            supervisor_observation: None,
         }
     }
 }
@@ -8598,9 +8630,25 @@ impl ComputeDriver for NoopTestDriver {
 
     async fn get_sandbox(
         &self,
-        _request: Request<GetSandboxRequest>,
+        request: Request<GetSandboxRequest>,
     ) -> Result<tonic::Response<openshell_core::proto::compute::v1::GetSandboxResponse>, Status>
     {
+        let request = request.into_inner();
+        if request.observe_supervisor
+            && let Some(observation) = &self.supervisor_observation
+            && request.sandbox_id == observation.sandbox_id
+        {
+            return Ok(tonic::Response::new(
+                openshell_core::proto::compute::v1::GetSandboxResponse {
+                    sandbox: Some(DriverSandbox {
+                        id: request.sandbox_id,
+                        name: request.name,
+                        ..Default::default()
+                    }),
+                    supervisor: Some(observation.clone()),
+                },
+            ));
+        }
         Err(Status::not_found("sandbox not found"))
     }
 
