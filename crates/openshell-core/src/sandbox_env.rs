@@ -472,6 +472,9 @@ pub const K8S_SA_TOKEN_FILE: &str = "OPENSHELL_K8S_SA_TOKEN_FILE";
 /// exchanges without using SPIFFE for gateway authentication.
 pub const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET: &str =
     "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET";
+/// Supervisor-only Workload API socket for gateway configuration admission.
+pub const BOOTSTRAP_SPIFFE_WORKLOAD_API_SOCKET: &str =
+    "OPENSHELL_BOOTSTRAP_SPIFFE_WORKLOAD_API_SOCKET";
 
 /// Resolved sandbox UID used to override `run_as_user` when the policy
 /// specifies a numeric value instead of the hardcoded "sandbox" user name.

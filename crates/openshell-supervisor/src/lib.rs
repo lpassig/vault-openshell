@@ -2775,16 +2775,50 @@ impl StartupGateway for RemoteStartupGateway {
         state: openshell_core::proto::ConfigurationAdmissionState,
         error: &str,
     ) -> Result<()> {
-        openshell_core::grpc_client::report_sandbox_configuration(
-            self.gateway()?,
-            id,
-            instance_id,
-            snapshot,
-            state,
-            error,
-        )
-        .await
+        report_configuration_admission(self.gateway()?, id, instance_id, snapshot, state, error)
+            .await
     }
+}
+
+async fn report_configuration_admission(
+    gateway: &openshell_core::grpc_client::GatewayEndpoint,
+    sandbox_id: &str,
+    instance_id: &str,
+    snapshot: Option<&openshell_core::grpc_client::SettingsPollResult>,
+    state: openshell_core::proto::ConfigurationAdmissionState,
+    error: &str,
+) -> Result<()> {
+    use openshell_core::{grpc_client, proto::ConfigurationAdmissionState, sandbox_env};
+
+    if state == ConfigurationAdmissionState::Accepted
+        && let Some(socket) = std::env::var_os(sandbox_env::BOOTSTRAP_SPIFFE_WORKLOAD_API_SOCKET)
+    {
+        return grpc_attempt("SPIFFE configuration admission", async {
+            let identity = openshell_spire::supervisor_tls_identity(std::path::Path::new(&socket))
+                .await
+                .map_err(grpc_client::grpc_status_error)?;
+            grpc_client::report_sandbox_configuration_with_identity(
+                gateway,
+                sandbox_id,
+                instance_id,
+                snapshot,
+                state,
+                error,
+                Some(identity),
+            )
+            .await
+        })
+        .await;
+    }
+    grpc_client::report_sandbox_configuration(
+        gateway,
+        sandbox_id,
+        instance_id,
+        snapshot,
+        state,
+        error,
+    )
+    .await
 }
 
 /// Load sandbox policy from local files or gRPC.

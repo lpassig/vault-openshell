@@ -4,6 +4,9 @@
 //! Gateway-owned sandbox identities obtained through the SPIFFE Broker API.
 
 mod broker;
+mod workload;
+
+pub use workload::supervisor_tls_identity;
 
 use openshell_core::config::SpiffeBrokerConfig;
 use openshell_core::token_grant_failure::{

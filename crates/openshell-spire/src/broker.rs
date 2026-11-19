@@ -195,14 +195,9 @@ async fn channel(
         (None, Some(prefix)) => (prefix, ServerIdentity::PathPrefix(prefix.clone())),
         _ => return Err(configuration_failure()),
     };
-    let workload_endpoint = format!("unix:{}", config.workload_api_socket_path);
-    let workload = spiffe::WorkloadApiClient::connect_to(workload_endpoint)
-        .await
-        .map_err(workload_failure)?;
     // Fetch afresh at every acquisition. Neither client credentials nor trust
     // bundles are pinned across their Workload API rotation.
-    let context = workload
-        .fetch_x509_context()
+    let context = crate::workload::fetch_x509_context(&config.workload_api_socket_path)
         .await
         .map_err(workload_failure)?;
     let svid = context.default_svid().ok_or_else(identity_rejected)?;

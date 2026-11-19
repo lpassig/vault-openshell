@@ -16,6 +16,7 @@ openshell-spiffe = { path = "../openshell-spiffe" }
 openshell-crypto = { workspace = true }
 async-trait = "0.1"
 http = { workspace = true }
+pem = "3"
 prost = { workspace = true }
 spiffe = { workspace = true, features = ["workload-api-x509"] }
 tokio = { workspace = true }
@@ -27,6 +28,7 @@ rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 tower = { workspace = true }
 uuid = { workspace = true }
+zeroize = { workspace = true }
 
 [lints]
 workspace = true

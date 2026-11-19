@@ -5307,6 +5307,7 @@ dependencies = [
  "openshell-core",
  "openshell-crypto",
  "openshell-spiffe",
+ "pem 3.0.6",
  "prost",
  "rustls",
  "spiffe",
@@ -5316,6 +5317,7 @@ dependencies = [
  "tonic-prost",
  "tower",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -5341,6 +5343,7 @@ dependencies = [
  "openshell-otel-test-support",
  "openshell-policy",
  "openshell-sandbox-backend",
+ "openshell-spire",
  "openshell-supervisor-control",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",

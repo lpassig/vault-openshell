@@ -1212,7 +1212,7 @@ async fn report_runtime_configuration(
                 .build()
         );
     }
-    openshell_core::grpc_client::report_sandbox_configuration(
+    crate::report_configuration_admission(
         &ctx.gateway,
         &ctx.sandbox_id,
         instance_id,

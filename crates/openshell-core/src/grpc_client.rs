@@ -43,7 +43,7 @@ use openshell_extension_core::{BearerTokenSlot, ExtensionCredentialStore};
 use tonic::Status;
 use tonic::metadata::AsciiMetadataValue;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::{debug, info, warn};
 
 /// Preserve the gRPC status as a source so callers can classify retryable errors.
@@ -378,8 +378,12 @@ fn configure_gateway_tls(
     ep: Endpoint,
     ca_pem: Vec<u8>,
     server_name: Option<&str>,
+    identity: Option<Identity>,
 ) -> Result<Endpoint> {
     let mut tls_config = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem));
+    if let Some(identity) = identity {
+        tls_config = tls_config.identity(identity);
+    }
     if let Some(server_name) = server_name.filter(|name| !name.is_empty()) {
         tls_config = tls_config.domain_name(server_name);
     }
@@ -397,6 +401,10 @@ fn configure_gateway_tls(
 /// When the endpoint uses `http://`, a plaintext connection is used (for
 /// deployments where TLS is disabled, e.g. behind a Cloudflare Tunnel).
 fn build_plain_endpoint(endpoint: &str) -> Result<Endpoint> {
+    build_gateway_endpoint(endpoint, None)
+}
+
+fn build_gateway_endpoint(endpoint: &str, identity: Option<Identity>) -> Result<Endpoint> {
     let mut ep = Endpoint::from_shared(endpoint.to_string())
         .into_diagnostic()
         .wrap_err("invalid gRPC endpoint")?
@@ -410,6 +418,11 @@ fn build_plain_endpoint(endpoint: &str) -> Result<Endpoint> {
         .http2_adaptive_window(true);
 
     let tls_enabled = endpoint.starts_with("https://");
+    if identity.is_some() && !tls_enabled {
+        return Err(grpc_status_error(Status::failed_precondition(
+            "SPIFFE configuration admission requires an HTTPS gateway",
+        )));
+    }
 
     // TODO: The TLS CA is loaded once here and never re-read. The gateway
     // server side supports hot-reload (ArcSwap + notify in tls.rs). The
@@ -428,7 +441,7 @@ fn build_plain_endpoint(endpoint: &str) -> Result<Endpoint> {
         // webpki, destination, or child-process roots here: an image that can
         // influence DNS must not broaden supervisor→gateway authentication.
         let server_name = std::env::var(sandbox_env::GATEWAY_TLS_SERVER_NAME).ok();
-        ep = configure_gateway_tls(ep, ca_pem, server_name.as_deref())?;
+        ep = configure_gateway_tls(ep, ca_pem, server_name.as_deref(), identity)?;
     }
 
     Ok(ep)
@@ -549,7 +562,7 @@ mod gateway_tls_isolation_tests {
         server_name: &str,
     ) -> Result<Channel> {
         let endpoint = Endpoint::from_shared(format!("https://{address}")).into_diagnostic()?;
-        configure_gateway_tls(endpoint, pki.ca_pem.clone(), Some(server_name))?
+        configure_gateway_tls(endpoint, pki.ca_pem.clone(), Some(server_name), None)?
             .connect()
             .await
             .into_diagnostic()
@@ -595,19 +608,33 @@ mod gateway_tls_isolation_tests {
 /// instance's credentials. The first connection starts that instance's
 /// renewal task.
 async fn connect_channel(gateway: &GatewayEndpoint) -> Result<AuthedChannel> {
+    connect_channel_with_identity(gateway, None).await
+}
+
+async fn connect_channel_with_identity(
+    gateway: &GatewayEndpoint,
+    identity: Option<Identity>,
+) -> Result<AuthedChannel> {
     if gateway.credentials.is_revoked() {
         return Err(miette::miette!(
             "sandbox instance gateway credentials were revoked"
         ));
     }
-    let channel = build_plain_channel(gateway.url()).await?;
+    let uses_workload_identity = identity.is_some();
+    let channel = build_gateway_endpoint(gateway.url(), identity)?
+        .connect()
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to connect to OpenShell server")?;
     let intercepted = InterceptedService::new(
         channel.clone(),
         AuthInterceptor::new(gateway.credentials.inner.bearer.clone()),
     );
-    gateway
-        .credentials
-        .start_renewal(&intercepted, &channel, gateway.url());
+    if !uses_workload_identity {
+        gateway
+            .credentials
+            .start_renewal(&intercepted, &channel, gateway.url());
+    }
     Ok(intercepted)
 }
 
@@ -1372,11 +1399,6 @@ pub async fn sync_policy_and_fetch_snapshot(
 
 /// Report an exact runtime configuration generation. Pending registration uses
 /// the snapshot's instance fence; retain that snapshot across registration retries.
-#[tracing::instrument(
-    name = "supervisor.gateway.report_sandbox_configuration",
-    skip_all,
-    fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
-)]
 pub async fn report_sandbox_configuration(
     gateway: &GatewayEndpoint,
     sandbox_id: &str,
@@ -1385,8 +1407,36 @@ pub async fn report_sandbox_configuration(
     state: crate::proto::ConfigurationAdmissionState,
     error: &str,
 ) -> Result<()> {
+    report_sandbox_configuration_with_identity(
+        gateway,
+        sandbox_id,
+        instance_id,
+        snapshot,
+        state,
+        error,
+        None,
+    )
+    .await
+}
+
+/// Send a configuration report using the gateway bearer and, when provided,
+/// a fresh client certificate. Gateway CA verification is identical for both paths.
+#[tracing::instrument(
+    name = "supervisor.gateway.report_sandbox_configuration",
+    skip_all,
+    fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
+)]
+pub async fn report_sandbox_configuration_with_identity(
+    gateway: &GatewayEndpoint,
+    sandbox_id: &str,
+    instance_id: &str,
+    snapshot: Option<&SettingsPollResult>,
+    state: crate::proto::ConfigurationAdmissionState,
+    error: &str,
+    identity: Option<Identity>,
+) -> Result<()> {
     let status = ClientSpanStatus::current();
-    let mut client = connect(gateway).await?;
+    let mut client = OpenShellClient::new(connect_channel_with_identity(gateway, identity).await?);
     client
         .report_sandbox_configuration(crate::proto::ReportSandboxConfigurationRequest {
             sandbox_id: sandbox_id.to_string(),

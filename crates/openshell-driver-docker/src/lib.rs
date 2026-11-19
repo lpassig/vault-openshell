@@ -281,6 +281,9 @@ pub struct DockerComputeConfig {
     /// Host UNIX socket projected into the supervisor for provider identity.
     pub provider_spiffe_workload_api_socket: Option<PathBuf>,
 
+    /// Host UNIX socket projected into the supervisor for bootstrap mTLS.
+    pub bootstrap_spiffe_workload_api_socket: Option<PathBuf>,
+
     /// `AppArmor` confinement requested for the workload container.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_armor_profile: Option<AppArmorProfile>,
@@ -304,6 +307,15 @@ impl DockerComputeConfig {
         validate_docker_proxy_auth_file(&self.upstream_proxy)?;
         validate_docker_proxy_ca_bundle(self)?;
         if let Some(socket) = self.provider_spiffe_workload_api_socket.as_deref() {
+            openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket)
+                .map_err(Error::config)?;
+        }
+        if let Some(socket) = self.bootstrap_spiffe_workload_api_socket.as_deref() {
+            if self.provider_spiffe_workload_api_socket.is_some() || self.guest_tls_ca.is_none() {
+                return Err(Error::config(
+                    "bootstrap SPIFFE socket requires guest_tls_ca and excludes the provider SPIFFE socket",
+                ));
+            }
             openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket)
                 .map_err(Error::config)?;
         }
@@ -344,6 +356,7 @@ impl Default for DockerComputeConfig {
             upstream_proxy: UpstreamProxyConfig::default(),
             proxy_ca_bundle: None,
             provider_spiffe_workload_api_socket: None,
+            bootstrap_spiffe_workload_api_socket: None,
             app_armor_profile: None,
         }
     }
@@ -381,6 +394,7 @@ struct DockerDriverRuntimeConfig {
     upstream_proxy: UpstreamProxyConfig,
     proxy_ca_bundle: Option<PathBuf>,
     provider_spiffe_workload_api_socket: Option<PathBuf>,
+    bootstrap_spiffe_workload_api_socket: Option<PathBuf>,
     app_armor_profile: Option<AppArmorProfile>,
     /// Immutable gateway-normalized additional destination trust. This is
     /// deliberately separate from `DockerComputeConfig` and sandbox input.
@@ -1054,6 +1068,9 @@ impl DockerComputeDriver {
                 proxy_ca_bundle: docker_config.proxy_ca_bundle.clone(),
                 provider_spiffe_workload_api_socket: docker_config
                     .provider_spiffe_workload_api_socket
+                    .clone(),
+                bootstrap_spiffe_workload_api_socket: docker_config
+                    .bootstrap_spiffe_workload_api_socket
                     .clone(),
                 app_armor_profile: docker_config.app_armor_profile.clone(),
                 network_trust,
@@ -5707,13 +5724,30 @@ async fn spawn_docker_control_process(
             openshell_core::sandbox_env::TLS_CA
         ));
     }
-    if let Some(socket) = config.provider_spiffe_workload_api_socket.as_ref() {
+    let spiffe_projection = config
+        .bootstrap_spiffe_workload_api_socket
+        .as_ref()
+        .map(|socket| {
+            (
+                openshell_core::sandbox_env::BOOTSTRAP_SPIFFE_WORKLOAD_API_SOCKET,
+                socket,
+            )
+        })
+        .or_else(|| {
+            config
+                .provider_spiffe_workload_api_socket
+                .as_ref()
+                .map(|socket| {
+                    (
+                        openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+                        socket,
+                    )
+                })
+        });
+    if let Some((name, socket)) = spiffe_projection {
         let projected = openshell_core::driver_utils::projected_provider_spiffe_socket_path(socket)
             .map_err(Status::failed_precondition)?;
-        environment.push(format!(
-            "{}={projected}",
-            openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET
-        ));
+        environment.push(format!("{name}={projected}"));
     }
     let supervisor_archive = docker_supervisor_bundle_archive(sandbox, config).await?;
     stage_docker_supervisor_bundle(docker, sandbox, config, supervisor_archive).await?;
@@ -5794,10 +5828,10 @@ async fn spawn_docker_control_process(
     if let Some(bundle) = config.network_trust.as_ref() {
         supervisor_mounts.push(docker_network_trust_supervisor_mount(bundle)?);
     }
-    if let Some(socket) = config.provider_spiffe_workload_api_socket.as_ref() {
-        let parent = socket.parent().ok_or_else(|| {
-            Status::failed_precondition("provider SPIFFE socket has no parent directory")
-        })?;
+    if let Some((_, socket)) = spiffe_projection {
+        let parent = socket
+            .parent()
+            .ok_or_else(|| Status::failed_precondition("SPIFFE socket has no parent directory"))?;
         supervisor_mounts.push(Mount {
             target: Some(PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR.to_string()),
             source: Some(parent.display().to_string()),
@@ -6242,6 +6276,7 @@ fn docker_child_environment(sandbox: &DriverSandbox) -> HashMap<String, String> 
         environment.extend(spec.environment.clone());
     }
     for protected in [
+        openshell_core::sandbox_env::BOOTSTRAP_SPIFFE_WORKLOAD_API_SOCKET,
         openshell_core::sandbox_env::ENDPOINT,
         openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
         openshell_core::sandbox_env::MAIN_PROCESS_SPEC,
