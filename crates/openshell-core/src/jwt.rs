@@ -188,6 +188,8 @@ mod session {
         runtime_generation: SandboxGenerationId,
         auth_epoch: CredentialEpoch,
         component: SessionComponent,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<crate::bootstrap_identity::Grant>,
     }
 
     /// Claims of the supervisor token. It names no sandbox, generation, or
@@ -890,18 +892,37 @@ mod session {
             sandbox_token_id: Uuid,
             issued_at: i64,
         ) -> Result<MintedSessionTokenPair, SessionJwtError> {
+            self.mint_pair_with_bootstrap(
+                identity,
+                gateway_token_id,
+                sandbox_token_id,
+                issued_at,
+                None,
+            )
+        }
+
+        pub fn mint_pair_with_bootstrap(
+            &self,
+            identity: &SandboxRuntimeIdentity,
+            gateway_token_id: Uuid,
+            sandbox_token_id: Uuid,
+            issued_at: i64,
+            bootstrap: Option<&crate::bootstrap_identity::Grant>,
+        ) -> Result<MintedSessionTokenPair, SessionJwtError> {
             Ok(MintedSessionTokenPair {
                 gateway: self.mint(
                     SessionTokenProfile::Gateway,
                     identity,
                     gateway_token_id,
                     issued_at,
+                    bootstrap,
                 )?,
                 sandbox: self.mint(
                     SessionTokenProfile::Sandbox,
                     identity,
                     sandbox_token_id,
                     issued_at,
+                    bootstrap,
                 )?,
                 auth_epoch: identity.auth_epoch,
             })
@@ -990,10 +1011,22 @@ mod session {
             identity: &SandboxRuntimeIdentity,
             token_id: Uuid,
             issued_at: i64,
+            bootstrap: Option<&crate::bootstrap_identity::Grant>,
         ) -> Result<MintedSessionToken, SessionJwtError> {
-            let expires_at = self.ttl.map_or(0, |ttl| {
+            let mut expires_at = self.ttl.map_or(0, |ttl| {
                 issued_at.saturating_add(i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX))
             });
+            if let Some(grant) = bootstrap {
+                validate_bootstrap(grant, identity)?;
+                if grant.expires_at <= issued_at {
+                    return Err(SessionJwtError::Expired);
+                }
+                expires_at = if expires_at == 0 {
+                    grant.expires_at
+                } else {
+                    expires_at.min(grant.expires_at)
+                };
+            }
             let claims = SessionClaims {
                 iss: self.issuer.clone(),
                 sub: format!("{SANDBOX_SUBJECT_PREFIX}{}", identity.sandbox_id),
@@ -1005,6 +1038,7 @@ mod session {
                 runtime_generation: identity.runtime_generation.clone(),
                 auth_epoch: identity.auth_epoch,
                 component: SessionComponent::OpenShellSupervisor,
+                bootstrap: bootstrap.cloned(),
             };
             let mut header = Header::new(Algorithm::EdDSA);
             header.kid = Some(self.key_id.clone());
@@ -1054,6 +1088,7 @@ mod session {
         pub token_id: Uuid,
         pub issued_at: i64,
         pub expires_at: i64,
+        pub bootstrap: Option<crate::bootstrap_identity::Grant>,
     }
 
     impl SessionJwtVerifier {
@@ -1151,6 +1186,22 @@ mod session {
                 .map_err(|_| SessionJwtError::InvalidRuntimeIdentity)?;
             let token_id = Uuid::parse_str(&claims.jti).map_err(|_| SessionJwtError::InvalidJti)?;
             validate_lifetime(claims.iat, claims.exp, self.clock.now_unix_seconds())?;
+            if let Some(grant) = &claims.bootstrap {
+                validate_bootstrap(
+                    grant,
+                    &SandboxRuntimeIdentity {
+                        sandbox_id: claims.sandbox_id.clone(),
+                        runtime_generation: claims.runtime_generation.clone(),
+                        auth_epoch: claims.auth_epoch,
+                    },
+                )?;
+                if claims.exp == 0
+                    || claims.exp > grant.expires_at
+                    || grant.expires_at <= self.clock.now_unix_seconds()
+                {
+                    return Err(SessionJwtError::Expired);
+                }
+            }
             Ok(AuthenticatedSandboxSession {
                 sandbox_id: claims.sandbox_id,
                 runtime_generation: claims.runtime_generation,
@@ -1158,6 +1209,7 @@ mod session {
                 token_id,
                 issued_at: claims.iat,
                 expires_at: claims.exp,
+                bootstrap: claims.bootstrap,
             })
         }
     }
@@ -1375,6 +1427,26 @@ mod session {
         openshell_crypto::install_jwt_provider();
     }
 
+    fn validate_bootstrap(
+        grant: &crate::bootstrap_identity::Grant,
+        identity: &SandboxRuntimeIdentity,
+    ) -> Result<(), SessionJwtError> {
+        if grant.intent.sandbox_id != identity.sandbox_id.as_str()
+            || grant.intent.generation != identity.runtime_generation.as_str()
+            || grant.intent.auth_epoch != identity.auth_epoch.get()
+            || grant.device_id.is_empty()
+            || Uuid::parse_str(&grant.decision_id).is_err()
+            || Uuid::parse_str(&grant.challenge).is_err()
+            || grant.scopes != std::collections::BTreeSet::from(["bootstrap".to_string()])
+            || grant.issued_at <= 0
+            || grant.expires_at <= grant.issued_at
+            || grant.expires_at.saturating_sub(grant.issued_at) > 60
+        {
+            return Err(SessionJwtError::InvalidRuntimeIdentity);
+        }
+        Ok(())
+    }
+
     fn validate_ttl(ttl: Duration) -> Result<(), SessionJwtError> {
         if !(MIN_SESSION_TOKEN_TTL..=MAX_SESSION_TOKEN_TTL).contains(&ttl) {
             return Err(SessionJwtError::InvalidLifetime);
@@ -1533,6 +1605,85 @@ mod tests {
                 auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
             };
             (issuer, gateway, sandbox, identity)
+        }
+
+        #[test]
+        fn bootstrap_claims_cap_both_profiles_and_preserve_legacy_shape() {
+            let (issuer, gateway, sandbox, identity) = fixture();
+            let legacy = issuer.mint_pair(&identity).unwrap();
+            let claims = gateway
+                .verify(legacy.gateway.token.expose_secret())
+                .unwrap();
+            assert!(claims.bootstrap.is_none());
+            use base64::Engine as _;
+            let payload = legacy
+                .gateway
+                .token
+                .expose_secret()
+                .split('.')
+                .nth(1)
+                .unwrap();
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .unwrap();
+            assert!(
+                serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .unwrap()
+                    .get("bootstrap")
+                    .is_none()
+            );
+            let grant = crate::bootstrap_identity::Grant {
+                decision_id: uuid::Uuid::new_v4().to_string(),
+                intent: crate::bootstrap_identity::SandboxIntent {
+                    gateway_id: "test".into(),
+                    sandbox_id: identity.sandbox_id.to_string(),
+                    workspace: "default".into(),
+                    owner: "user".into(),
+                    policy_digest: "digest".into(),
+                    driver: "kubernetes".into(),
+                    generation: identity.runtime_generation.to_string(),
+                    auth_epoch: 1,
+                    expected_spiffe_id: "spiffe://example.org/gateway/test/sandbox/sandbox-a"
+                        .into(),
+                },
+                device_id: "device".into(),
+                device_revision: "v1".into(),
+                host_id: None,
+                runtime_identity: None,
+                proof_key_digest: None,
+                selectors: std::collections::BTreeSet::new(),
+                challenge: uuid::Uuid::new_v4().to_string(),
+                issued_at: 1_900_000_000,
+                expires_at: 1_900_000_020,
+                scopes: std::collections::BTreeSet::from(["bootstrap".into()]),
+            };
+            let pair = issuer
+                .mint_pair_with_bootstrap(
+                    &identity,
+                    uuid::Uuid::new_v4(),
+                    uuid::Uuid::new_v4(),
+                    grant.issued_at,
+                    Some(&grant),
+                )
+                .unwrap();
+            for (verifier, token) in [(&gateway, pair.gateway), (&sandbox, pair.sandbox)] {
+                let session = verifier.verify(token.token.expose_secret()).unwrap();
+                assert_eq!(session.expires_at, grant.expires_at);
+                assert_eq!(session.bootstrap, Some(grant.clone()));
+            }
+            let mut wrong = grant.clone();
+            wrong.intent.sandbox_id = "other".into();
+            assert!(
+                issuer
+                    .mint_pair_with_bootstrap(
+                        &identity,
+                        uuid::Uuid::new_v4(),
+                        uuid::Uuid::new_v4(),
+                        grant.issued_at,
+                        Some(&wrong)
+                    )
+                    .is_err()
+            );
         }
 
         #[test]

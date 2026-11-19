@@ -60,6 +60,8 @@ telemetry = ["dep:reqwest", "dep:chrono", "reqwest?/blocking"]
 oauth = ["dep:reqwest"]
 ## Strict Ed25519 JWT issuance and verification for authenticated sandbox sessions.
 jwt = ["dep:jsonwebtoken", "dep:zeroize"]
+## Bootstrap authorization engine and local OPA evaluator. Runtime enablement is separate.
+bootstrap-authz = ["jwt", "dep:tempfile"]
 ## Conversions to `openshell-otel` types.
 otel = ["dep:openshell-otel"]
 ## Command-line flags shared by compute drivers.

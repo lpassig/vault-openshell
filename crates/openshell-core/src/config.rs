@@ -267,6 +267,25 @@ pub struct SpiffeBrokerConfig {
     pub workload_api_socket_path: String,
 }
 
+/// Experimental two-gate authorization. Built-in evidence adapters deny until replaced.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BootstrapAuthorizationConfig {
+    pub enabled: bool,
+    pub opa_executable: PathBuf,
+    pub timeout_ms: u64,
+}
+
+impl Default for BootstrapAuthorizationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            opa_executable: PathBuf::from("opa"),
+            timeout_ms: 2000,
+        }
+    }
+}
+
 impl SpiffeBrokerConfig {
     /// Resolve the selected transport without making Kubernetes API calls.
     /// Node-local mode requires the Pod's trusted Downward API node address.
@@ -416,6 +435,8 @@ pub struct Config {
     pub gateway_jwt: Option<GatewayJwtConfig>,
     /// Gateway-only access to SPIRE; shared supervisors receive access tokens.
     pub spiffe_broker: Option<SpiffeBrokerConfig>,
+    /// Opt-in bootstrap authorization. Missing configuration preserves legacy behavior.
+    pub bootstrap_authorization: Option<BootstrapAuthorizationConfig>,
 
     /// Database URL for persistence.
     pub database_url: String,
@@ -1218,6 +1239,7 @@ impl Config {
             audit: GatewayAuditConfig::default(),
             gateway_jwt: None,
             spiffe_broker: None,
+            bootstrap_authorization: None,
             database_url: String::new(),
             database_auth: DatabaseAuthMode::default(),
             database_max_connections: None,

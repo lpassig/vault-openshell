@@ -12,6 +12,9 @@
 pub mod activity;
 pub mod app_listener;
 pub mod auth;
+#[cfg(feature = "bootstrap-authz")]
+pub mod bootstrap_authz;
+pub mod bootstrap_identity;
 pub mod color;
 pub mod compute;
 pub mod config;
