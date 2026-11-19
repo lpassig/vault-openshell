@@ -620,6 +620,9 @@ struct Fixture {
     bearer: String,
     grant: Grant,
     signing: jsonwebtoken::EncodingKey,
+    supervisor_auth: openshell_core::jwt::SupervisorAuthBundle,
+    proof_signer: openshell_core::bootstrap_signer::BootstrapProofSigner,
+    enrollment_path: std::path::PathBuf,
     revoked: Arc<AtomicBool>,
     vault: MockServer,
     oauth: MockServer,
@@ -866,19 +869,47 @@ impl Fixture {
             "kubernetes://default/runtime/pod".into(),
         );
         state.store.put_message(&sandbox).await.unwrap();
-        let bearer = authority
+        let launch = authority
             .mint_persisted_launch("sandbox-a", &identity)
-            .unwrap()
-            .supervisor
-            .gateway_token
-            .expose_secret()
-            .to_owned();
+            .unwrap();
+        let enrollment_path = directory.path().join(format!(
+            "sandbox-a.{}.{}.json",
+            identity.runtime_generation,
+            identity.auth_epoch.get(),
+        ));
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let enrollment_file = std::fs::OpenOptions::new()
+            .mode(0o600)
+            .write(true)
+            .create_new(true)
+            .open(&enrollment_path)
+            .unwrap();
+        serde_json::to_writer(
+            enrollment_file,
+            &serde_json::json!({
+                "gateway_id": launch.gateway_id,
+                "runtime_identity": "kubernetes://default/runtime/pod",
+                "verification_keys": launch.verification_keys,
+                "private_key_pem": workload_key.serialize_pem().unwrap(),
+            }),
+        )
+        .unwrap();
+        let proof_signer = openshell_core::bootstrap_signer::BootstrapProofSigner::new(
+            directory.path().to_path_buf(),
+            "sandbox-a",
+            &launch.supervisor,
+        )
+        .unwrap();
+        let bearer = launch.supervisor.gateway_token.expose_secret().to_owned();
         Self {
             state,
             key,
             bearer,
             grant,
             signing,
+            supervisor_auth: launch.supervisor,
+            proof_signer,
+            enrollment_path,
             revoked,
             vault,
             oauth,
@@ -954,6 +985,90 @@ impl Fixture {
             .filter(|r| r.method == "GET")
             .count()
     }
+}
+
+#[tokio::test]
+async fn bootstrap_provider_client_uses_the_enrolled_assignment_key() {
+    use crate::auth::audit::ConnectionSource;
+    use crate::multiplex::MultiplexService;
+    use openshell_core::grpc_client::{
+        GatewayCredentials, GatewayEndpoint, SandboxProviderTokenClient,
+    };
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = crate::test_environment::fixture_dir().unwrap();
+    crate::test_environment::Environment::new()
+        .set(
+            openshell_core::sandbox_env::TLS_CA,
+            directory.path().join("ca.pem"),
+        )
+        .remove(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME)
+        .run_async(async {
+            let fixture = Fixture::new().await;
+            crate::tls_test_utils::generate_test_certs_with_ca(directory.path());
+            let acceptor = crate::TlsAcceptor::from_files(
+                &directory.path().join("server-cert.pem"),
+                &directory.path().join("server-key.pem"),
+                None,
+                false,
+                None,
+                None,
+                vec![],
+            )
+            .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let service = MultiplexService::new(fixture.state.clone());
+            let _server = AbortServer(tokio::spawn(async move {
+                loop {
+                    let (stream, peer) = listener.accept().await.unwrap();
+                    openshell_core::net::set_tcp_nodelay_best_effort(&stream);
+                    let acceptor = acceptor.acceptor();
+                    let service = service.clone();
+                    tokio::spawn(async move {
+                        if let Ok(stream) = acceptor.accept(stream).await {
+                            let _ = service
+                                .serve_tls(stream, ConnectionSource::Peer(peer))
+                                .await;
+                        }
+                    });
+                }
+            }));
+            let credentials = GatewayCredentials::from_auth_bundle(&fixture.supervisor_auth)
+                .unwrap()
+                .with_workload_proof_signer(fixture.proof_signer.clone());
+            let client = SandboxProviderTokenClient::new(GatewayEndpoint::new(
+                format!("https://localhost:{port}"),
+                credentials.clone(),
+            ));
+            let request = || {
+                client.get_access_token_with_svid_audience(
+                    &fixture.key,
+                    None,
+                    "fixture-token-service",
+                )
+            };
+            std::fs::set_permissions(
+                &fixture.enrollment_path,
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+            assert!(request().await.is_err());
+            assert_eq!(fixture.vault_reads().await, 0);
+            std::fs::set_permissions(
+                &fixture.enrollment_path,
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            let token = request().await.unwrap();
+            assert_eq!(token.access_token, "fixture-upstream-token");
+            let reads = fixture.vault_reads().await;
+            assert!(reads > 0);
+            credentials.revoke();
+            assert!(request().await.is_err());
+            assert_eq!(fixture.vault_reads().await, reads);
+        })
+        .await;
 }
 
 #[tokio::test]
