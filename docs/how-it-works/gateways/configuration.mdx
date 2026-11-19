@@ -1700,11 +1700,20 @@ for example `"spiffe://example.org/openshell"`. Use `config_delivery_mode = "pol
 and set `[openshell.gateway.tls].client_ca_path` to the SPIFFE trust bundle. Set
 both `enabled` and `operator_enabled` to `false` in
 `[openshell.gateway.mtls_auth]`. Omit `spiffe_broker` and the Docker driver's
-`provider_spiffe_workload_api_socket`. Integrated supervisors must present a
-client X.509-SVID for their observed container and launch generation to
-activate their configuration. This mode requires external SPIRE enrollment
-and currently supports sandboxes without provider attachments. Restart the
-gateway when you change the SPIFFE client CA bundle.
+`provider_spiffe_workload_api_socket`. Set
+`[openshell.drivers.docker].bootstrap_spiffe_workload_api_socket` to the host
+SPIRE Agent Unix socket and set `guest_tls_ca` to the gateway server CA. The
+driver projects the socket into the supervisor container. The supervisor
+fetches one X.509-SVID per accepted configuration report and presents it on
+that report's HTTPS connection.
+
+An external registrar must enroll the supervisor's exact identity
+`<prefix>/gateway/<gateway-id>/sandbox/<sandbox-id>/generation/<generation>/epoch/<epoch>/supervisor/<container-id>`.
+Enroll from trusted Docker runtime observations and issue one identity to that
+supervisor. Keep the host socket directory exclusive to the supervisor. Use
+an authorized policy which the supervisor can apply directly, and leave
+provider attachments empty. Restart the gateway when you change the SPIFFE
+client CA bundle.
 
 The initial slice rejects session renewal, extension credential issuance,
 credential-bearing configuration snapshots, and legacy intermediate-exchange
