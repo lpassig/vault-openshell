@@ -8,7 +8,7 @@ use spiffe::{WorkloadApiClient, WorkloadApiError, X509Context};
 use tonic::{Status, transport::Identity};
 use zeroize::Zeroizing;
 
-pub(super) async fn fetch_x509_context(socket: &str) -> Result<X509Context, WorkloadApiError> {
+pub async fn fetch_x509_context(socket: &str) -> Result<X509Context, WorkloadApiError> {
     WorkloadApiClient::connect_to(format!("unix:{socket}"))
         .await?
         .fetch_x509_context()
