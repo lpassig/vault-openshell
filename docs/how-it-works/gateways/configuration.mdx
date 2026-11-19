@@ -1660,10 +1660,9 @@ sandbox and 64 per gateway, including when token caching is disabled.
 
 ### Experimental bootstrap authorization
 
-Bootstrap authorization is disabled by default. The experimental gateway path
-admits a sandbox before minting its launch JWTs, then requires a fresh signed
-workload proof before each gateway-owned provider-token request. Both JWT
-profiles expire within the admission decision's maximum 60-second lifetime.
+Bootstrap authorization is disabled by default. When enabled, the gateway
+authorizes sandbox creation before minting launch JWTs. Both JWT profiles
+expire within the admission decision's maximum 60-second lifetime.
 
 ```toml
 [openshell.gateway.bootstrap_authorization]
@@ -1672,10 +1671,8 @@ opa_executable = "/usr/local/bin/opa"
 timeout_ms = 2000
 ```
 
-Enabling this path requires gateway TLS, gateway JWT signing with a positive TTL, the SPIFFE
-broker, Kubernetes `supervisor_topology = "gateway"`, and no supervisor
-`provider_spiffe_workload_api_socket_path`. The OPA executable must be an
-absolute file path. Device/host attestation and owner/mission authorization
+Enabling this path requires gateway TLS and gateway JWT signing with a positive
+TTL. The OPA executable must be an absolute file path. Device/host attestation and owner/mission authorization
 adapters are integration interfaces; the built-in adapters deny every admission.
 The gateway does not ship a production enrollment service or a supervisor key
 signer. Enabling the flag with the shipped adapters therefore prevents new
@@ -1689,16 +1686,29 @@ sharing the gateway signing identity must enforce the same flag and policy.
 Changing the flag invalidates existing sandbox JWTs issued in the previous
 mode. Revoking the stored grant blocks new authenticated bootstrap requests.
 
-An integrated caller supplies `x-openshell-workload-proof` to
+On Kubernetes, configure `spiffe_broker` and `supervisor_topology = "gateway"`
+and omit the supervisor `provider_spiffe_workload_api_socket_path`. An
+integrated caller supplies a fresh `x-openshell-workload-proof` to
 `GetSandboxProviderAccessToken`. The gateway verifies an Ed25519 proof against
 an independently attested workload key and binds it to the sandbox, generation,
 credential epoch, gateway bearer ID, admission decision, device, audience and
 configured credential. Proofs expire within 30 seconds and are single-use
-across gateway replicas. A JWT-SVID match alone cannot satisfy key possession.
+across gateway replicas.
+
+On Docker, set `docker_spiffe_id_prefix` in the bootstrap authorization table,
+for example `"spiffe://example.org/openshell"`. Use `config_delivery_mode = "poll"`
+and set `[openshell.gateway.tls].client_ca_path` to the SPIFFE trust bundle. Set
+both `enabled` and `operator_enabled` to `false` in
+`[openshell.gateway.mtls_auth]`. Omit `spiffe_broker` and the Docker driver's
+`provider_spiffe_workload_api_socket`. Integrated supervisors must present a
+client X.509-SVID for their observed container and launch generation to
+activate their configuration. This mode requires external SPIRE enrollment
+and currently supports sandboxes without provider attachments. Restart the
+gateway when you change the SPIFFE client CA bundle.
 
 The initial slice rejects session renewal, extension credential issuance,
 credential-bearing configuration snapshots, and legacy intermediate-exchange
-requests while enabled. It bypasses provider-token caches. Real adapters must
+requests while enabled. The Kubernetes provider-token path bypasses its cache. Real adapters must
 verify fresh requester and host posture, runtime/key binding and trusted SPIRE
 selector facts; they must also revalidate sandbox authorization. This is an
 integration slice, not a production-ready deployment mode.

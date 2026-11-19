@@ -35,7 +35,7 @@ Verified implementation: the shipped `UnavailableDeviceAttestation` and `Unavail
 
 Unverified integration requirements: select and implement real requester/host attestation and owner/mission authorities, independently enroll workload keys, and verify SPIRE selector/registration provenance. Gateway embedding integrations can replace the adapter interfaces; a deployable provider bridge and supervisor signer are additional work. VAAS can implement the authorizer interface later and is not assumed by this implementation.
 
-Verified implementation: CLI activation requires gateway TLS, Kubernetes gateway supervision, positive session TTLs, a SPIFFE broker, and no configured supervisor Workload API socket. Unverified deployment requirement: every replica sharing a gateway signing identity must enforce the same flag and policy; mixed enabled/disabled replicas allow a downgrade through the disabled replica. Operators must also prevent alternate Workload API access and authorization-server grant policies from bypassing gateway mediation. The gateway flag cannot revoke credentials or sockets already distributed outside its configuration.
+Verified implementation. Both modes require gateway TLS and positive session TTLs. Kubernetes uses gateway supervision and the SPIFFE broker. Docker checks an X.509-SVID and a live container observation at polling configuration admission and confines the decision to configuration activation. See [Docker SPIRE prototype](03-lifecycle-integration.md#docker-spire-prototype). Unverified deployment requirement. Use the same flag and policy on every replica sharing a gateway signing identity. The gateway flag cannot revoke credentials or sockets already distributed outside its configuration.
 
 Verified boundary: Gate 2 guards provider credentials. Launch still prepares SSH identity and applies configured OTLP authentication headers/client TLS before Gate 2; see [`prepare_ssh_identity` and `encode_launch_authentication`](../../crates/openshell-server/src/compute/mod.rs). These are bootstrap infrastructure exceptions. Unverified deployment assumption: operators constrain their destinations and privileges. This slice does not establish workload/host attestation before those infrastructure credentials exist, nor resolve the design's open question about deferring them.
 
@@ -53,9 +53,9 @@ The [lifecycle integration design](03-lifecycle-integration.md) maps upstream co
 
 ## Suggested PR description
 
-Add opt-in bootstrap authorization before sandbox launch JWT issuance and before gateway-owned provider-token acquisition. Preserve legacy behavior by default. Require independently verified device/host and sandbox authorization plus a signed, single-use workload proof; deny unsupported credential paths while enabled.
+Add opt-in bootstrap authorization before sandbox launch JWT issuance and before gateway-owned Kubernetes provider-token acquisition. Bind Docker polling configuration admission to a live container observation and the supervisor's SPIFFE mTLS connection. Both paths revalidate device, host and sandbox authorization and restrict the resulting decision to the requested operation.
 
-The default adapters deny until a real verifier and authorization authority are integrated. Tests exercise signed proofs, local OPA, gateway enforcement, mock SPIRE identity and Vault/OAuth access ordering. This slice is intended for integration and review, with production enrollment, signing, renewal and static-secret delivery still deferred.
+The default adapters deny until a real verifier and authorization authority are integrated. Tests exercise signed proofs, local OPA, Docker configuration admission, mock SPIRE identity, and Vault/OAuth access ordering. Production enrollment, signing, renewal and Docker provider delivery remain open.
 
 | Threat | Mitigation in this slice | Residual risk |
 | --- | --- | --- |
@@ -63,6 +63,7 @@ The default adapters deny until a real verifier and authorization authority are 
 | Captured bearer and unconsumed proof | Gateway TLS, narrow request binding, short proof expiry and atomic consumption. | A thief can win the first-use race; TLS-channel binding or encrypted delivery is not implemented. |
 | Replayed proof or expired decision | Atomic persistent proof receipts, short proof/decision expiry, current grant lookup. | Receipt/audit retention and production scaling need qualification. |
 | Same-domain SVID for another sandbox | Exact configured SPIFFE mapping, sandbox/runtime/generation/epoch binding. | Incorrect or compromised SPIRE registrations remain a trust-root risk. |
+| Copied Docker launch JWT | Require same-connection SPIFFE mTLS and a current driver observation before accepting configuration. | Trusted registration and runtime isolation determine who can use the supervisor key. |
 | Vault or cache bypass | Gate before subject resolution, cache bypass, denial of unguarded snapshot and legacy exchange paths. | Independent administrator exports and external grant paths require separate control. |
 | Revocation during asynchronous work | Current authorization/evidence/runtime rechecks before grants and delivery. | Rechecks and external issuance are not atomic; already-exported credentials require issuer-side revocation or expiry. |
 | Mixed replica configuration | Require consistent flag, policy and adapter configuration across replicas. | A disabled replica sharing signing keys can bypass admission; deployment enforcement remains an integration requirement. |
