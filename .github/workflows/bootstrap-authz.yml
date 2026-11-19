@@ -8,13 +8,19 @@ on:
     branches: ["codex/**"]
     paths:
       - "crates/openshell-core/**"
+      - "crates/openshell-crypto/**"
+      - "crates/openshell-driver-docker/**"
       - "crates/openshell-server/**"
+      - "proto/compute_driver.proto"
       - ".github/workflows/bootstrap-authz.yml"
       - "Cargo.lock"
   pull_request:
     paths:
       - "crates/openshell-core/**"
+      - "crates/openshell-crypto/**"
+      - "crates/openshell-driver-docker/**"
       - "crates/openshell-server/**"
+      - "proto/compute_driver.proto"
       - ".github/workflows/bootstrap-authz.yml"
       - "Cargo.lock"
   workflow_dispatch:
@@ -52,6 +58,10 @@ jobs:
           echo "OPENSHELL_TEST_OPA=$RUNNER_TEMP/opa" >> "$GITHUB_ENV"
       - name: Format
         run: cargo fmt --all -- --check
+      - name: SPIFFE client identity verification
+        run: cargo test --locked -p openshell-crypto --lib --test spiffe_client
+      - name: Docker supervisor observation
+        run: cargo test --locked -p openshell-driver-docker --lib bootstrap_observation
       - name: Core authorization and JWT regressions
         run: cargo test --locked -p openshell-core --no-default-features --features bootstrap-authz --lib -- --include-ignored
       - name: Gateway and Vault security integration
