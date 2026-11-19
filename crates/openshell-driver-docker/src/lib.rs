@@ -30,7 +30,8 @@ use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
     CONDITION_EXITED, CONDITION_RUNTIME_RESTART, CONDITION_WORKSPACE_VALIDATION_FAILED,
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
-    LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE, SANDBOX_RUNTIME_IMAGE_BINARY_PATH,
+    LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE, LABEL_SUPERVISOR_AUTH_EPOCH,
+    LABEL_SUPERVISOR_GENERATION, SANDBOX_RUNTIME_IMAGE_BINARY_PATH,
     SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED, WORKSPACE_VALIDATION_FAILED_MESSAGE,
     extract_first_tar_entry, supervisor_image_should_refresh, temp_extract_container_name,
     validate_linux_elf_binary,
@@ -133,8 +134,6 @@ const LABEL_ISOLATION_BACKEND_OPEN_SHELL: &str = openshell_sandbox_backend::BACK
 const LABEL_ISOLATION_ROLE: &str = "openshell.ai/isolation-role";
 const LABEL_ISOLATION_ROLE_SANDBOX: &str = "sandbox";
 const LABEL_ISOLATION_ROLE_SUPERVISOR: &str = "supervisor";
-const LABEL_SUPERVISOR_GENERATION: &str = "openshell.ai/supervisor-generation";
-const LABEL_SUPERVISOR_AUTH_EPOCH: &str = "openshell.ai/supervisor-auth-epoch";
 const LABEL_ISOLATION_ROLE_STAGING: &str = "staging";
 const LABEL_ISOLATION_ROLE_IDENTITY: &str = "identity";
 const RUNTIME_DESCRIPTOR_FILE: &str = "runtime-descriptor.json";
@@ -5610,28 +5609,12 @@ fn observed_docker_supervisor(
     {
         return None;
     }
-    let id = inspected.id.as_deref()?;
-    if id.len() != 64
-        || !id
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return None;
-    }
-    let generation = openshell_core::sandbox_generation::SandboxGenerationId::parse(
-        labels.get(LABEL_SUPERVISOR_GENERATION)?.as_str(),
+    openshell_core::driver_utils::local_supervisor_observation(
+        "docker",
+        &sandbox.id,
+        inspected.id.as_deref()?,
+        labels,
     )
-    .ok()?;
-    let auth_epoch = labels
-        .get(LABEL_SUPERVISOR_AUTH_EPOCH)?
-        .parse::<std::num::NonZeroU64>()
-        .ok()?;
-    Some(SupervisorRuntimeObservation {
-        sandbox_id: sandbox.id.clone(),
-        runtime_identity: format!("docker://{id}"),
-        generation: generation.to_string(),
-        auth_epoch: auth_epoch.get(),
-    })
 }
 
 async fn spawn_docker_control_process(

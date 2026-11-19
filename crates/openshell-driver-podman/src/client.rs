@@ -92,6 +92,8 @@ pub struct ContainerInspect {
     pub mounts: Option<Vec<Value>>,
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub image: String,
     pub state: ContainerState,
     #[serde(default)]
     #[allow(dead_code)] // kept for podman API compat

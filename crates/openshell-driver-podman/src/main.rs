@@ -134,6 +134,10 @@ struct Args {
     #[arg(long, env = "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET")]
     provider_spiffe_workload_api_socket: Option<PathBuf>,
 
+    /// Host UNIX socket projected only into supervisors for bootstrap mTLS.
+    #[arg(long, env = "OPENSHELL_PODMAN_BOOTSTRAP_SPIFFE_WORKLOAD_API_SOCKET")]
+    bootstrap_spiffe_workload_api_socket: Option<PathBuf>,
+
     /// `AppArmor` model: `RuntimeDefault`, `Unconfined`, or `Localhost/<profile>`.
     #[arg(long, env = "OPENSHELL_APP_ARMOR_PROFILE")]
     app_armor_profile: Option<AppArmorProfile>,
@@ -252,6 +256,7 @@ async fn main() -> Result<()> {
             guest_tls_cert: args.podman_tls_cert,
             guest_tls_key: args.podman_tls_key,
             provider_spiffe_workload_api_socket: args.provider_spiffe_workload_api_socket,
+            bootstrap_spiffe_workload_api_socket: args.bootstrap_spiffe_workload_api_socket,
             app_armor_profile: args.app_armor_profile,
             sandbox_pids_limit: args.sandbox_pids_limit,
             health_check_interval_secs: args.health_check_interval_secs,

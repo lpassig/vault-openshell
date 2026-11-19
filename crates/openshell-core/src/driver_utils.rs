@@ -721,6 +721,42 @@ pub fn validate_upstream_proxy_settings(
 /// Container-side directory where the provider SPIFFE Workload API socket is mounted.
 pub const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str = "/spiffe-workload-api";
 
+pub const LABEL_SUPERVISOR_GENERATION: &str = "openshell.ai/supervisor-generation";
+pub const LABEL_SUPERVISOR_AUTH_EPOCH: &str = "openshell.ai/supervisor-auth-epoch";
+
+/// Decode driver-owned launch labels after verifying the running container.
+pub fn local_supervisor_observation(
+    driver: &str,
+    sandbox_id: &str,
+    container_id: &str,
+    labels: &std::collections::HashMap<String, String, impl std::hash::BuildHasher>,
+) -> Option<crate::proto::compute::v1::SupervisorRuntimeObservation> {
+    if !is_full_container_id(container_id) {
+        return None;
+    }
+    let generation = crate::sandbox_generation::SandboxGenerationId::parse(
+        labels.get(LABEL_SUPERVISOR_GENERATION)?.as_str(),
+    )
+    .ok()?;
+    let auth_epoch = labels
+        .get(LABEL_SUPERVISOR_AUTH_EPOCH)?
+        .parse::<std::num::NonZeroU64>()
+        .ok()?;
+    Some(crate::proto::compute::v1::SupervisorRuntimeObservation {
+        sandbox_id: sandbox_id.into(),
+        runtime_identity: format!("{driver}://{container_id}"),
+        generation: generation.to_string(),
+        auth_epoch: auth_epoch.get(),
+    })
+}
+
+pub fn is_full_container_id(id: &str) -> bool {
+    id.len() == 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Validate a host UNIX socket selected for provider SPIFFE projection.
 ///
 /// Local container drivers bind-mount the socket's dedicated parent directory,

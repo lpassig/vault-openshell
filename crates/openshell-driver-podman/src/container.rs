@@ -782,6 +782,7 @@ fn build_env(
 
     env.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     env.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+    env.remove(openshell_core::sandbox_env::BOOTSTRAP_SPIFFE_WORKLOAD_API_SOCKET);
     // Prevent user-supplied environment from overriding the TLS server name
     // the supervisor verifies — a sandbox user who can redirect the gateway
     // hostname could otherwise present a certificate for a name they control
@@ -1592,6 +1593,22 @@ pub struct IsolationSpecs {
 }
 
 impl IsolationSpecs {
+    pub(crate) fn record_supervisor_launch(
+        &mut self,
+        auth: &openshell_core::jwt::SupervisorAuthBundle,
+    ) {
+        self.supervisor.labels.extend([
+            (
+                openshell_core::driver_utils::LABEL_SUPERVISOR_GENERATION.into(),
+                auth.runtime_generation.to_string(),
+            ),
+            (
+                openshell_core::driver_utils::LABEL_SUPERVISOR_AUTH_EPOCH.into(),
+                auth.auth_epoch.get().to_string(),
+            ),
+        ]);
+    }
+
     pub(crate) fn record_resource_identities(
         &mut self,
         identities: &BTreeMap<String, Value>,
@@ -1784,6 +1801,27 @@ pub fn build_isolation_specs(
         trusted_mount(&mount.destination)
             && mount.destination != openshell_core::container_paths::NETNS_MOUNT_ROOT
     });
+    if let Some(socket) = input.config.bootstrap_spiffe_workload_api_socket.as_deref() {
+        for labels in [&mut workload.labels, &mut supervisor.labels] {
+            labels.remove(openshell_core::driver_utils::LABEL_SUPERVISOR_GENERATION);
+            labels.remove(openshell_core::driver_utils::LABEL_SUPERVISOR_AUTH_EPOCH);
+        }
+        let guest = openshell_core::driver_utils::projected_provider_spiffe_socket_path(socket)
+            .map_err(ComputeDriverError::Precondition)?;
+        let source = socket.parent().ok_or_else(|| {
+            ComputeDriverError::Precondition("SPIFFE socket parent is required".into())
+        })?;
+        supervisor.env.insert(
+            openshell_core::sandbox_env::BOOTSTRAP_SPIFFE_WORKLOAD_API_SOCKET.into(),
+            guest,
+        );
+        supervisor.mounts.push(Mount {
+            kind: "bind".into(),
+            source: source.display().to_string(),
+            destination: PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR.into(),
+            options: vec!["ro".into(), "rbind".into()],
+        });
+    }
     for destination in ["/run", "/var/log", "/tmp"] {
         supervisor.mounts.push(Mount {
             kind: "tmpfs".into(),
@@ -4153,6 +4191,87 @@ mod tests {
                 .any(|a| a == "--upstream-proxy-connect-by-hostname"),
             "hostname CONNECT flag present on opt-in: {command:?}"
         );
+    }
+
+    #[test]
+    fn bootstrap_spiffe_socket_is_projected_only_into_the_supervisor() {
+        use openshell_core::driver_utils::{
+            LABEL_SUPERVISOR_AUTH_EPOCH, LABEL_SUPERVISOR_GENERATION,
+        };
+        use openshell_core::sandbox_env::BOOTSTRAP_SPIFFE_WORKLOAD_API_SOCKET;
+        let mut sandbox = test_sandbox("bootstrap-id", "bootstrap-name");
+        let template = sandbox
+            .spec
+            .get_or_insert_default()
+            .template
+            .get_or_insert_default();
+        template.environment.insert(
+            BOOTSTRAP_SPIFFE_WORKLOAD_API_SOCKET.into(),
+            "/user/socket".into(),
+        );
+        template
+            .labels
+            .insert(LABEL_SUPERVISOR_GENERATION.into(), "user-generation".into());
+        template
+            .labels
+            .insert(LABEL_SUPERVISOR_AUTH_EPOCH.into(), "9".into());
+        let config = PodmanComputeConfig {
+            guest_tls_ca: Some("/host/ca.crt".into()),
+            bootstrap_spiffe_workload_api_socket: Some("/run/spire/agent.sock".into()),
+            ..test_config()
+        };
+        let identity = openshell_isolation_interface::contract::ResolvedWorkloadIdentity::new(
+            1000,
+            1001,
+            vec![],
+            "image".into(),
+            "sha256:image".into(),
+        )
+        .unwrap();
+        let image = resolved_image("image", "sha256:image", "1000:1001", "");
+        let specs = build_isolation_specs(IsolationSpecInput {
+            sandbox: &sandbox,
+            config: &config,
+            token_secret: None,
+            resolver_secret: "resolver",
+            gpu_devices: None,
+            image: &image,
+            supervisor_bin: None,
+            tls_secrets: None,
+            network_trust: None,
+            identity: &identity,
+        })
+        .unwrap();
+        assert!(
+            !specs
+                .workload
+                .env
+                .contains_key(BOOTSTRAP_SPIFFE_WORKLOAD_API_SOCKET)
+        );
+        assert_eq!(
+            specs
+                .supervisor
+                .env
+                .get(BOOTSTRAP_SPIFFE_WORKLOAD_API_SOCKET)
+                .map(String::as_str),
+            Some("/spiffe-workload-api/agent.sock")
+        );
+        assert!(
+            specs
+                .workload
+                .mounts
+                .iter()
+                .all(|mount| mount.destination != PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR)
+        );
+        assert!(specs.supervisor.mounts.iter().any(|mount| {
+            mount.destination == PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR
+                && mount.source == "/run/spire"
+                && mount.options.iter().any(|option| option == "ro")
+        }));
+        for spec in [&specs.workload, &specs.supervisor] {
+            assert!(!spec.labels.contains_key(LABEL_SUPERVISOR_GENERATION));
+            assert!(!spec.labels.contains_key(LABEL_SUPERVISOR_AUTH_EPOCH));
+        }
     }
 
     #[test]

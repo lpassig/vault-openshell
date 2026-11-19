@@ -103,6 +103,8 @@ pub struct PodmanComputeConfig {
     /// Host path to a SPIFFE Workload API Unix socket exposed to sandbox
     /// supervisors for provider token exchange client assertions.
     pub provider_spiffe_workload_api_socket: Option<PathBuf>,
+    /// Host SPIFFE Workload API Unix socket projected into the bootstrap supervisor.
+    pub bootstrap_spiffe_workload_api_socket: Option<PathBuf>,
     /// `AppArmor` confinement requested for the workload container. Omission
     /// sends no override and preserves Podman's runtime-selected profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -281,6 +283,20 @@ impl PodmanComputeConfig {
                 openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket)
                     .map_err(crate::client::PodmanApiError::InvalidInput)?;
             }
+        }
+        if let Some(socket) = self.bootstrap_spiffe_workload_api_socket.as_deref() {
+            if self.provider_spiffe_workload_api_socket.is_some() || self.guest_tls_ca.is_none() {
+                return Err(crate::client::PodmanApiError::InvalidInput(
+                    "bootstrap SPIFFE socket requires guest_tls_ca and excludes the provider SPIFFE socket".into(),
+                ));
+            }
+            if self.enable_bind_mounts {
+                return Err(crate::client::PodmanApiError::InvalidInput(
+                    "bootstrap SPIFFE socket requires supervisor-only socket access; disable sandbox host bind mounts".into(),
+                ));
+            }
+            openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket)
+                .map_err(crate::client::PodmanApiError::InvalidInput)?;
         }
         self.canonicalize_userns()?;
         self.validate_userns_mappings()
@@ -558,6 +574,7 @@ impl Default for PodmanComputeConfig {
             sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
             enable_bind_mounts: false,
             provider_spiffe_workload_api_socket: None,
+            bootstrap_spiffe_workload_api_socket: None,
             app_armor_profile: None,
             health_check_interval_secs: None,
             https_proxy: None,
@@ -596,6 +613,10 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field(
                 "provider_spiffe_workload_api_socket",
                 &self.provider_spiffe_workload_api_socket,
+            )
+            .field(
+                "bootstrap_spiffe_workload_api_socket",
+                &self.bootstrap_spiffe_workload_api_socket,
             )
             .field("app_armor_profile", &self.app_armor_profile)
             .field(
@@ -1133,6 +1154,40 @@ mod tests {
     }
 
     // ── TLS config validation ─────────────────────────────────────────
+
+    #[test]
+    fn bootstrap_socket_requires_tls_and_supervisor_only_access() {
+        let mut config = PodmanComputeConfig {
+            bootstrap_spiffe_workload_api_socket: Some("/run/spire/agent.sock".into()),
+            ..Default::default()
+        };
+        assert!(
+            config
+                .validate_configuration()
+                .unwrap_err()
+                .to_string()
+                .contains("guest_tls_ca")
+        );
+        config.guest_tls_ca = Some("/tls/ca.crt".into());
+        config.validate_configuration().unwrap();
+        config.enable_bind_mounts = true;
+        assert!(
+            config
+                .validate_configuration()
+                .unwrap_err()
+                .to_string()
+                .contains("disable sandbox host bind mounts")
+        );
+        config.enable_bind_mounts = false;
+        config.provider_spiffe_workload_api_socket = Some("/run/spire/provider.sock".into());
+        assert!(
+            config
+                .validate_configuration()
+                .unwrap_err()
+                .to_string()
+                .contains("excludes the provider SPIFFE socket")
+        );
+    }
 
     #[test]
     fn validate_tls_config_all_none_is_ok() {

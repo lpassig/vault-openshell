@@ -12,8 +12,9 @@ use crate::watcher::{
 };
 use openshell_core::config::CDI_GPU_DEVICE_ALL;
 use openshell_core::driver_utils::{
-    SANDBOX_RUNTIME_IMAGE_BINARY_PATH, extract_first_tar_entry, supervisor_image_should_refresh,
-    temp_extract_container_name, validate_linux_elf_binary, write_cache_binary_atomic,
+    SANDBOX_RUNTIME_IMAGE_BINARY_PATH, extract_first_tar_entry, is_full_container_id,
+    local_supervisor_observation, supervisor_image_should_refresh, temp_extract_container_name,
+    validate_linux_elf_binary, write_cache_binary_atomic,
 };
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
@@ -25,6 +26,7 @@ use openshell_core::network_trust::{
 use openshell_core::proto::compute::v1::{
     CpuResourceCapabilities, DriverSandbox, GetCapabilitiesResponse, GpuResourceCapabilities,
     GpuResourceRequirements, MemoryResourceCapabilities, ResourceCapabilities,
+    SupervisorRuntimeObservation,
 };
 use openshell_core::{ComputeDriverError, NetworkSupervisorTrustBundle};
 use std::collections::HashMap;
@@ -1568,6 +1570,9 @@ impl PodmanComputeDriver {
                             .copy_to_container(&workload_id, "/sandbox", archives.workspace)
                             .await?;
                     }
+                    if self.config.bootstrap_spiffe_workload_api_socket.is_some() {
+                        specs.record_supervisor_launch(&launch_authentication.supervisor);
+                    }
                     let supervisor_id = self
                         .client
                         .create_typed_container(&specs.supervisor)
@@ -2367,6 +2372,53 @@ impl PodmanComputeDriver {
         }
     }
 
+    /// Observe the live, driver-launched supervisor through the configured
+    /// Podman daemon. Never use workload labels or a caller-supplied ID.
+    pub(crate) async fn observe_supervisor(
+        &self,
+        sandbox: &DriverSandbox,
+    ) -> Result<Option<SupervisorRuntimeObservation>, ComputeDriverError> {
+        if self.config.bootstrap_spiffe_workload_api_socket.is_none() {
+            return Ok(None);
+        }
+        let name = crate::isolation::supervisor_name(&sandbox.id);
+        let inspected = match self.client.inspect_container(&name).await {
+            Ok(inspected) => inspected,
+            Err(PodmanApiError::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let labels = &inspected.config.labels;
+        if !inspected.state.running
+            || inspected.name.trim_start_matches('/') != name
+            || labels.get(container::LABEL_MANAGED).map(String::as_str) != Some("true")
+            || labels.get(crate::isolation::LABEL_ROLE).map(String::as_str) != Some("supervisor")
+            || labels.get(LABEL_SANDBOX_ID) != Some(&sandbox.id)
+            || labels.get(container::LABEL_SANDBOX_WORKSPACE) != Some(&sandbox.workspace)
+        {
+            return Ok(None);
+        }
+        let image_id = inspected
+            .image
+            .strip_prefix("sha256:")
+            .unwrap_or(&inspected.image);
+        if !is_full_container_id(image_id) {
+            return Ok(None);
+        }
+        let expected = self
+            .client
+            .inspect_image(&self.config.supervisor_image)
+            .await?;
+        if expected.id.strip_prefix("sha256:").unwrap_or(&expected.id) != image_id {
+            return Ok(None);
+        }
+        Ok(local_supervisor_observation(
+            "podman",
+            &sandbox.id,
+            &inspected.id,
+            labels,
+        ))
+    }
+
     /// List all managed sandboxes.
     ///
     /// Only inspects running containers (to get health status). Non-running
@@ -2682,6 +2734,78 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    #[tokio::test]
+    async fn bootstrap_observation_requires_a_live_supervisor_with_the_pinned_image() {
+        use openshell_core::driver_utils::{
+            LABEL_SUPERVISOR_AUTH_EPOCH, LABEL_SUPERVISOR_GENERATION,
+        };
+        let id = "a".repeat(64);
+        let image = "b".repeat(64);
+        let observed = |running, role: &str| {
+            serde_json::json!({
+                "Id": id,
+                "Name": "openshell-supervisor-observed",
+                "Image": image,
+                "State": {"Running": running, "Status": if running { "running" } else { "exited" }},
+                "Config": {"Labels": {
+                    (container::LABEL_MANAGED): "true",
+                    (crate::isolation::LABEL_ROLE): role,
+                    (LABEL_SANDBOX_ID): "observed",
+                    (container::LABEL_SANDBOX_NAMESPACE): "default",
+                    (container::LABEL_SANDBOX_WORKSPACE): "workspace-a",
+                    (LABEL_SUPERVISOR_GENERATION): "generation-a",
+                    (LABEL_SUPERVISOR_AUTH_EPOCH): "2"
+                }}
+            })
+        };
+        let ok = |body: serde_json::Value| StubResponse::new(StatusCode::OK, body.to_string());
+        let (socket, requests, handle) = spawn_podman_stub(
+            "bootstrap-inspect",
+            vec![
+                ok(observed(false, "supervisor")),
+                ok(observed(true, "sandbox")),
+                ok(observed(true, "supervisor")),
+                ok(serde_json::json!({"Id": "c".repeat(64)})),
+                ok(observed(true, "supervisor")),
+                ok(serde_json::json!({"Id": format!("sha256:{image}")})),
+            ],
+        );
+        let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            socket_path: Some(socket),
+            supervisor_image: "trusted-supervisor".into(),
+            bootstrap_spiffe_workload_api_socket: Some("/run/spire/agent.sock".into()),
+            ..Default::default()
+        });
+        let sandbox = DriverSandbox {
+            id: "observed".into(),
+            namespace: "default".into(),
+            workspace: "workspace-a".into(),
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            assert!(driver.observe_supervisor(&sandbox).await.unwrap().is_none());
+        }
+        let observation = driver.observe_supervisor(&sandbox).await.unwrap().unwrap();
+        assert_eq!(observation.sandbox_id, sandbox.id);
+        assert_eq!(observation.runtime_identity, format!("podman://{id}"));
+        assert_eq!(observation.generation, "generation-a");
+        assert_eq!(observation.auth_epoch, 2);
+        handle.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 6);
+        assert_eq!(
+            requests[0],
+            format!(
+                "GET {}",
+                api_path("/libpod/containers/openshell-supervisor-observed/json")
+            )
+        );
+        assert_eq!(
+            requests[5],
+            format!("GET {}", api_path("/libpod/images/trusted-supervisor/json"))
+        );
+    }
 
     fn launch_authentication() -> SandboxLaunchAuthentication {
         SandboxLaunchAuthentication {

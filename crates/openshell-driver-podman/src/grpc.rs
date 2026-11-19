@@ -121,9 +121,22 @@ impl ComputeDriver for ComputeDriverService {
                     .await
                     .map_err(Status::from)?
                     .ok_or_else(|| Status::not_found("sandbox not found"))?;
+                let supervisor = if request.observe_supervisor {
+                    if request.sandbox_id != sandbox.id {
+                        return Err(Status::failed_precondition(
+                            "sandbox_id did not match the fetched sandbox",
+                        ));
+                    }
+                    self.driver
+                        .observe_supervisor(&sandbox)
+                        .await
+                        .map_err(Status::from)?
+                } else {
+                    None
+                };
                 Ok(Response::new(GetSandboxResponse {
                     sandbox: Some(sandbox),
-                    supervisor: None,
+                    supervisor,
                 }))
             })
             .await
