@@ -1672,16 +1672,29 @@ timeout_ms = 2000
 ```
 
 Enabling this path requires gateway TLS and gateway JWT signing with a positive
-TTL. The OPA executable must be an absolute file path. Device/host attestation and owner/mission authorization
-adapters are integration interfaces; the built-in adapters deny every admission.
-The gateway does not ship a production enrollment service or a supervisor key
-signer. Enabling the flag with the shipped adapters therefore prevents new
-sandbox launch credentials from being issued.
+TTL. The OPA executable must be an absolute file path. Configure a trusted
+device and host posture service to enable the owner-based pilot.
+
+```toml
+[openshell.gateway.bootstrap_authorization.posture_authority]
+endpoint = "https://posture.example.com/verify"
+ca_bundle = "/etc/openshell/posture/ca.pem"
+client_identity_pem = "/etc/openshell/posture/gateway-client.pem"
+```
+
+The authority must authenticate the gateway client certificate. The gateway
+uses the configured CA bundle to authenticate the authority. The client PEM
+contains the gateway's client certificate chain and private key. The sandbox
+owner must have an explicit user or admin membership in the active workspace.
+The gateway checks this membership at admission and before credential use.
+Without a posture authority, the default adapters deny admission.
 
 Admission requires exactly one `x-openshell-device-evidence` header. Its opaque
 evidence or session reference must let the attestation adapter verify the
 claimant against the authenticated owner, sandbox intent and fresh gateway
-challenge. Looking up an owner's enrolled device is insufficient. All replicas
+challenge. Pass the reference from a file with
+`openshell sandbox create --device-evidence-file <path>`. This option requires
+a direct HTTPS connection with gateway certificate verification. All replicas
 sharing the gateway signing identity must enforce the same flag and policy.
 Changing the flag invalidates existing sandbox JWTs issued in the previous
 mode. Revoking the stored grant blocks new authenticated bootstrap requests.
@@ -1693,7 +1706,10 @@ integrated caller supplies a fresh `x-openshell-workload-proof` to
 an independently attested workload key and binds it to the sandbox, generation,
 credential epoch, gateway bearer ID, admission decision, device, audience and
 configured credential. Proofs expire within 30 seconds and are single-use
-across gateway replicas.
+across gateway replicas. Bootstrap configuration carries metadata for dynamic
+grants. The OAuth exchange and Vault reads remain gated by workload proof.
+The stock Kubernetes supervisor still requires a workload key enrollment and
+signing integration.
 
 On Docker, set `docker_spiffe_id_prefix` in the bootstrap authorization table,
 for example `"spiffe://example.org/openshell"`. Use `config_delivery_mode = "poll"`
