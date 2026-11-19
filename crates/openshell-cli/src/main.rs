@@ -1453,6 +1453,10 @@ enum SandboxCommands {
         #[arg(long, add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
+        /// Read the bootstrap posture evidence reference from a file.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        device_evidence_file: Option<PathBuf>,
+
         /// Create the sandbox from a named sandbox template.
         #[arg(long, conflicts_with_all = ["from", "gpu", "cpu", "memory", "driver_config_json", "envs", "env_from"])]
         template: Option<String>,
@@ -3414,6 +3418,7 @@ async fn run_async() -> Result<()> {
             match command {
                 SandboxCommands::Create {
                     name,
+                    device_evidence_file,
                     template,
                     from,
                     upload,
@@ -3505,6 +3510,7 @@ async fn run_async() -> Result<()> {
                         &ctx.name,
                         run::SandboxCreateConfig {
                             name: name.as_deref(),
+                            device_evidence_file: device_evidence_file.as_deref(),
                             template: template.as_deref(),
                             from: from.as_deref(),
                             uploads: &upload_specs,

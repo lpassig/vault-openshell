@@ -433,6 +433,7 @@ async fn finalize_sandbox_create_session(
 #[derive(Debug)]
 pub struct SandboxCreateConfig<'a> {
     pub name: Option<&'a str>,
+    pub device_evidence_file: Option<&'a Path>,
     pub template: Option<&'a str>,
     pub from: Option<&'a str>,
     pub uploads: &'a [(String, Option<String>, bool)],
@@ -465,6 +466,7 @@ impl Default for SandboxCreateConfig<'_> {
     fn default() -> Self {
         Self {
             name: None,
+            device_evidence_file: None,
             template: None,
             from: None,
             uploads: &[],
@@ -495,6 +497,61 @@ impl Default for SandboxCreateConfig<'_> {
     }
 }
 
+fn read_create_device_evidence(
+    server: &str,
+    tls: &TlsOptions,
+    path: &Path,
+) -> Result<AsciiMetadataValue> {
+    use openshell_core::bootstrap_identity::MAX_DEVICE_EVIDENCE_BYTES;
+
+    if tls.gateway_insecure
+        || (tls.edge_token.is_some() && tls.oidc_token.is_none())
+        || !url::Url::parse(server).is_ok_and(|url| url.scheme() == "https")
+    {
+        return Err(miette::miette!(
+            "device evidence requires a direct HTTPS connection with gateway certificate verification"
+        ));
+    }
+    if !path.is_file() {
+        return Err(miette::miette!(
+            "device evidence must be supplied in a regular file"
+        ));
+    }
+    let mut contents = String::new();
+    std::fs::File::open(path)
+        .and_then(|file| {
+            file.take(MAX_DEVICE_EVIDENCE_BYTES as u64 + 1)
+                .read_to_string(&mut contents)
+        })
+        .into_diagnostic()
+        .wrap_err("cannot read device evidence file")?;
+    if contents.len() > MAX_DEVICE_EVIDENCE_BYTES || contents.trim().is_empty() {
+        return Err(miette::miette!("device evidence file size is invalid"));
+    }
+    let mut value = AsciiMetadataValue::try_from(contents.trim())
+        .map_err(|_| miette::miette!("device evidence must be a single ASCII metadata value"))?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
+#[cfg(test)]
+#[test]
+fn create_device_evidence_requires_verified_tls_and_is_sensitive() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), b"fixture-evidence\n").unwrap();
+    let mut tls = TlsOptions::new(None, None, None);
+    assert!(read_create_device_evidence("http://gateway.example", &tls, file.path()).is_err());
+    let evidence =
+        read_create_device_evidence("https://gateway.example", &tls, file.path()).unwrap();
+    assert!(evidence.is_sensitive());
+    assert_eq!(evidence.to_str().unwrap(), "fixture-evidence");
+    tls.gateway_insecure = true;
+    assert!(read_create_device_evidence("https://gateway.example", &tls, file.path()).is_err());
+    tls.gateway_insecure = false;
+    tls.edge_token = Some("fixture-edge-token".into());
+    assert!(read_create_device_evidence("https://gateway.example", &tls, file.path()).is_err());
+}
+
 /// Create a sandbox with default settings.
 pub async fn sandbox_create(
     server: &str,
@@ -505,6 +562,7 @@ pub async fn sandbox_create(
 ) -> Result<i32> {
     let SandboxCreateConfig {
         name,
+        device_evidence_file,
         template,
         from,
         uploads,
@@ -551,6 +609,10 @@ pub async fn sandbox_create(
     if expose == Some(0) {
         return Err(miette::miette!("--expose port must be in 1..=65535"));
     }
+
+    let device_evidence = device_evidence_file
+        .map(|path| read_create_device_evidence(server, tls, path))
+        .transpose()?;
 
     // Plan every upload before provisioning so a rejected one leaves no sandbox.
     let upload_plans = uploads
@@ -715,6 +777,13 @@ pub async fn sandbox_create(
             .collect(),
     };
 
+    let mut request = tonic::Request::new(request);
+    if let Some(evidence) = device_evidence {
+        request.metadata_mut().insert(
+            openshell_core::bootstrap_identity::DEVICE_EVIDENCE_HEADER,
+            evidence,
+        );
+    }
     let response = match client.create_sandbox(request).await {
         Ok(resp) => resp,
         Err(status) if status.code() == Code::AlreadyExists => {
