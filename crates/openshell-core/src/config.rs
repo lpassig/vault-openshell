@@ -277,6 +277,17 @@ pub struct BootstrapAuthorizationConfig {
     /// Enables the Docker polling activation prototype with this SPIFFE prefix.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docker_spiffe_id_prefix: Option<String>,
+    /// Trusted posture verifier for requester and running-host evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub posture_authority: Option<BootstrapPostureAuthorityConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapPostureAuthorityConfig {
+    pub endpoint: String,
+    pub ca_bundle: PathBuf,
+    pub client_identity_pem: PathBuf,
 }
 
 impl Default for BootstrapAuthorizationConfig {
@@ -286,6 +297,7 @@ impl Default for BootstrapAuthorizationConfig {
             opa_executable: PathBuf::from("opa"),
             timeout_ms: 2000,
             docker_spiffe_id_prefix: None,
+            posture_authority: None,
         }
     }
 }

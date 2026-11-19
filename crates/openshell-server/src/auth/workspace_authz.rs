@@ -265,7 +265,7 @@ fn is_platform_admin(identity_roles: &[String], admin_role: &str) -> bool {
 }
 
 /// Check whether `member_role` satisfies the `min_role` requirement.
-fn role_satisfies(member_role: ProtoWorkspaceRole, min_role: MinWorkspaceRole) -> bool {
+pub fn role_satisfies(member_role: ProtoWorkspaceRole, min_role: MinWorkspaceRole) -> bool {
     match min_role {
         MinWorkspaceRole::User => matches!(
             member_role,

@@ -399,7 +399,9 @@ impl BootstrapGate {
         };
         let result = tokio::time::timeout(self.timeout, async {
             validate_intent(&intent)?;
-            if device_evidence.is_empty() || device_evidence.len() > 16_384 {
+            if device_evidence.is_empty()
+                || device_evidence.len() > crate::bootstrap_identity::MAX_DEVICE_EVIDENCE_BYTES
+            {
                 return Err(Denial::MissingSignal);
             }
             self.sandbox_authorization.verify(&intent, now).await?;

@@ -1750,7 +1750,7 @@ fn hash_handle_component(hasher: &mut Sha256, value: &[u8]) {
 
 /// Resolve dynamic credentials (token grants) from the same records used for
 /// the provider-environment revision and static credential bindings.
-fn resolve_dynamic_credentials_from_records(
+pub(super) fn resolve_dynamic_credentials_from_records(
     catalog: &EffectiveProviderProfileCatalog,
     records: &[ProviderEnvironmentRecord],
 ) -> Result<HashMap<String, ProviderProfileCredential>, Status> {

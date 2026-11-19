@@ -98,6 +98,7 @@ sqlx = { workspace = true }
 sqlx-core = { workspace = true }
 reqwest = { workspace = true }
 uuid = { workspace = true }
+zeroize = { workspace = true }
 hmac = "0.12"
 sha2 = { workspace = true }
 jsonwebtoken = { workspace = true }

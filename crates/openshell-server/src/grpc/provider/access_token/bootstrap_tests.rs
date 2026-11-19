@@ -1142,7 +1142,7 @@ async fn bootstrap_gate_denies_create_before_runtime_or_launch_credentials() {
         ..Default::default()
     });
     request.metadata_mut().insert(
-        crate::auth::bootstrap::DEVICE_HEADER,
+        openshell_core::bootstrap_identity::DEVICE_EVIDENCE_HEADER,
         "fixture-device-session".parse().unwrap(),
     );
     request
@@ -1173,7 +1173,7 @@ async fn bootstrap_gate_denies_create_before_runtime_or_launch_credentials() {
 }
 
 #[tokio::test]
-async fn bootstrap_gate_rejects_legacy_exchange_and_snapshots_without_secret_reads() {
+async fn bootstrap_provider_snapshot_contains_descriptors_without_secret_reads() {
     let fixture = Fixture::new().await;
     let sandbox = fixture
         .state
@@ -1182,16 +1182,17 @@ async fn bootstrap_gate_rejects_legacy_exchange_and_snapshots_without_secret_rea
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        crate::grpc::policy::build_provider_environment_snapshot(
-            &fixture.state,
-            &sandbox,
-            true,
-            true
-        )
-        .await
-        .is_err()
-    );
+    let snapshot = crate::grpc::policy::build_provider_environment_snapshot(
+        &fixture.state,
+        &sandbox,
+        true,
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(snapshot.values.is_empty());
+    assert!(snapshot.files.is_empty());
+    assert!(snapshot.dynamic_credentials.contains_key(&fixture.key));
     assert_eq!(fixture.vault_reads().await, 0);
     assert!(fixture.oauth.received_requests().await.unwrap().is_empty());
 }

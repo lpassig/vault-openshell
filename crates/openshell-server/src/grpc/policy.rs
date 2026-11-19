@@ -3949,20 +3949,17 @@ pub async fn build_provider_environment_snapshot_from_inputs(
     supports_static_credential_bindings: bool,
     supports_stable_placeholder_environment_keys: bool,
 ) -> Result<ProviderEnvironmentSnapshot, Status> {
-    if let Some(gate) = &state.bootstrap_authorization {
-        if gate.docker_activation_enabled() {
-            crate::auth::bootstrap::BootstrapRuntime::require_credential_free(&inputs.sandbox)?;
-            let config = build_sandbox_config_snapshot_from_inputs(state, inputs).await?;
-            return Ok(ProviderEnvironmentSnapshot {
-                provider_env_revision: config.provider_env_revision,
-                provider_attachment_epoch: config.provider_attachment_epoch,
-                policy_hash: config.policy_hash,
-                ..Default::default()
-            });
-        }
-        return Err(gate
-            .reject(inputs.sandbox.object_id(), "provider_environment")
-            .await);
+    if let Some(gate) = &state.bootstrap_authorization
+        && gate.docker_activation_enabled()
+    {
+        crate::auth::bootstrap::BootstrapRuntime::require_credential_free(&inputs.sandbox)?;
+        let config = build_sandbox_config_snapshot_from_inputs(state, inputs).await?;
+        return Ok(ProviderEnvironmentSnapshot {
+            provider_env_revision: config.provider_env_revision,
+            provider_attachment_epoch: config.provider_attachment_epoch,
+            policy_hash: config.policy_hash,
+            ..Default::default()
+        });
     }
     let sandbox_id = inputs.sandbox.object_id().to_string();
     let ProviderEnvironmentTarget {
@@ -3976,7 +3973,17 @@ pub async fn build_provider_environment_snapshot_from_inputs(
     let provider_names = &spec.providers;
     let provider_profile_catalog = &inputs.catalog;
     let provider_records = &inputs.provider_records;
-    let mut provider_environment =
+    let mut provider_environment = if state.bootstrap_authorization.is_some() {
+        // Only descriptors for gateway-owned dynamic grants. Resolving the
+        // general environment here would read values without a workload permit.
+        super::provider::ProviderEnvironment {
+            dynamic_credentials: super::provider::resolve_dynamic_credentials_from_records(
+                provider_profile_catalog,
+                provider_records,
+            )?,
+            ..Default::default()
+        }
+    } else {
         super::provider::resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
             provider_profile_catalog,
             provider_records,
@@ -3984,7 +3991,8 @@ pub async fn build_provider_environment_snapshot_from_inputs(
             &state.credentials,
             Some(&sandbox_id),
         )
-        .await?;
+        .await?
+    };
 
     if matches!(policy_source, PolicySource::Global) {
         // A global policy replaces provider ACLs. Grants retain their profile

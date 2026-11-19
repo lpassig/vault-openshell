@@ -31,7 +31,6 @@ use crate::grpc::policy::{
     build_sandbox_config_snapshot_from_inputs, is_configuration_rejection,
     load_sandbox_config_inputs, unadmitted_sandbox_config,
 };
-use crate::persistence::ObjectId;
 use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex, dialable_peer_endpoint};
 
 pub use task::Registration;
@@ -469,18 +468,11 @@ async fn provider_environment(
     inputs: &SandboxConfigInputs,
     sandbox: &SandboxConfigSnapshot,
 ) -> (ProviderEnvironmentSnapshot, Option<(&'static str, Code)>) {
-    if let Some(gate) = &state.bootstrap_authorization {
-        let _ = gate
-            .reject(inputs.sandbox().object_id(), "cached_provider_environment")
-            .await;
-        return (
-            unresolved_provider_environment(sandbox),
-            Some(("bootstrap_authorization", Code::PermissionDenied)),
-        );
-    }
-    if let Some(cached) = record
-        .provider_environment()
-        .filter(|cached| names_provider_environment(sandbox, cached))
+    // A snapshot with resolved values must never skip bootstrap enforcement.
+    if state.bootstrap_authorization.is_none()
+        && let Some(cached) = record
+            .provider_environment()
+            .filter(|cached| names_provider_environment(sandbox, cached))
     {
         return (cached, None);
     }

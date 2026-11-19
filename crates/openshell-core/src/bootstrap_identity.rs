@@ -6,6 +6,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+pub const DEVICE_EVIDENCE_HEADER: &str = "x-openshell-device-evidence";
+pub const MAX_DEVICE_EVIDENCE_BYTES: usize = 16_384;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxIntent {

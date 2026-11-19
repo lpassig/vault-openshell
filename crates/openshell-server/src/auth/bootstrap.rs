@@ -3,14 +3,16 @@
 
 //! Gateway enforcement of bootstrap admission and per-request provider permits.
 
+mod authority;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use openshell_core::bootstrap_authz::{
-    AuditRecord, BootstrapGate, DecisionStore, Denial, Grant, JwtWorkloadProofVerifier,
-    RegoAuthorizer, SandboxIntent, Stage, UnavailableDeviceAttestation,
-    UnavailableSandboxAuthorization, WorkloadEvidence,
+    AuditRecord, BootstrapGate, DecisionStore, Denial, DeviceAttestationAdapter, Grant,
+    JwtWorkloadProofVerifier, RegoAuthorizer, SandboxAuthorizationAdapter, SandboxIntent, Stage,
+    UnavailableDeviceAttestation, UnavailableSandboxAuthorization, WorkloadEvidence,
 };
 use openshell_core::config::Config;
 use openshell_core::jwt::AuthenticatedSandboxSession;
@@ -32,7 +34,6 @@ const AUDIT_TYPE: &str = "bootstrap_authorization_decision";
 const GRANT_TYPE: &str = "bootstrap_authorization_grant";
 const PROOF_TYPE: &str = "bootstrap_authorization_proof";
 pub const PROOF_HEADER: &str = "x-openshell-workload-proof";
-pub const DEVICE_HEADER: &str = "x-openshell-device-evidence";
 pub const ACTIVATION_ANNOTATION: &str = "internal.openshell.ai/bootstrap-activation";
 
 #[derive(Serialize)]
@@ -156,13 +157,26 @@ impl BootstrapRuntime {
         {
             return Err("bootstrap_authorization requires an absolute OPA executable and timeout_ms between 1 and 10000".into());
         }
+        let (device, sandbox_authorization): (
+            Arc<dyn DeviceAttestationAdapter>,
+            Arc<dyn SandboxAuthorizationAdapter>,
+        ) = match settings.posture_authority.as_ref() {
+            Some(config) => (
+                Arc::new(authority::PostureAuthority::new(config)?),
+                Arc::new(authority::WorkspaceOwnerAuthorization(store.clone())),
+            ),
+            None => (
+                Arc::new(UnavailableDeviceAttestation),
+                Arc::new(UnavailableSandboxAuthorization),
+            ),
+        };
         let gate = BootstrapGate {
             authorizer: Arc::new(
                 RegoAuthorizer::new(settings.opa_executable.clone())
                     .map_err(|_| "cannot prepare bootstrap Rego policy")?,
             ),
-            device: Arc::new(UnavailableDeviceAttestation),
-            sandbox_authorization: Arc::new(UnavailableSandboxAuthorization),
+            device,
+            sandbox_authorization,
             proof: Arc::new(JwtWorkloadProofVerifier),
             store: Arc::new(PersistentDecisionStore(store.clone())),
             timeout: Duration::from_millis(settings.timeout_ms),

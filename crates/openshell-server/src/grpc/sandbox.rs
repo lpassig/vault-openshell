@@ -560,7 +560,7 @@ async fn handle_create_sandbox_inner(
     let principal = super::extract_principal(&request)?;
     let mut device_headers = request
         .metadata()
-        .get_all(crate::auth::bootstrap::DEVICE_HEADER)
+        .get_all(openshell_core::bootstrap_identity::DEVICE_EVIDENCE_HEADER)
         .iter();
     let device_evidence = device_headers
         .next()
