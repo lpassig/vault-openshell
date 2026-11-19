@@ -4,13 +4,13 @@
 //! TLS verification of a peer authorized by SPIFFE URI identity.
 
 use rustls::{
-    DigitallySignedStruct, RootCertStore, SignatureScheme,
+    DigitallySignedStruct, RootCertStore, ServerConnection, SignatureScheme,
     client::{
         danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
         verify_server_cert_signed_by_trust_anchor,
     },
     pki_types::{CertificateDer, ServerName, UnixTime},
-    server::ParsedCertificate,
+    server::{ParsedCertificate, WebPkiClientVerifier, danger::ClientCertVerifier},
 };
 use std::sync::Arc;
 use x509_parser::{extensions::GeneralName, prelude::FromDer};
@@ -45,10 +45,7 @@ impl ServerIdentity {
 fn spiffe_path(uri: &str) -> Option<(&str, &str)> {
     let (domain, path) = uri.strip_prefix("spiffe://")?.split_once('/')?;
     (uri.len() <= 2048
-        && !domain.is_empty()
-        && domain
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b".-_".contains(&b))
+        && valid_trust_domain(domain)
         && path.split('/').all(|segment| {
             !segment.is_empty()
                 && segment != "."
@@ -58,6 +55,136 @@ fn spiffe_path(uri: &str) -> Option<(&str, &str)> {
                     .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b))
         }))
     .then_some((domain, path))
+}
+
+fn valid_trust_domain(domain: &str) -> bool {
+    !domain.is_empty()
+        && domain.len() <= 255
+        && domain
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b".-_".contains(&b))
+}
+
+/// Validates the authenticated TLS client against an application trust bundle.
+/// Use a separate root store for workload identities and recreate the verifier
+/// when its trust bundle changes.
+#[derive(Debug)]
+pub struct SpiffeClientVerifier {
+    chain: Arc<dyn ClientCertVerifier>,
+    trust_domain: String,
+}
+
+/// Verified connection metadata. Only the client verifier creates this.
+#[derive(Clone, Debug)]
+pub struct VerifiedSpiffeClient {
+    id: String,
+    expires_at: i64,
+}
+
+impl VerifiedSpiffeClient {
+    /// Require the exact identity and check expiry at the point of authorization.
+    pub fn authorize(&self, expected: &str, now: UnixTime) -> Result<i64, rustls::Error> {
+        if self.id != expected || !is_unexpired(self.expires_at, now) {
+            return Err(rustls::Error::General(
+                "unexpected or expired SPIFFE client identity".into(),
+            ));
+        }
+        Ok(self.expires_at)
+    }
+}
+
+impl SpiffeClientVerifier {
+    /// Supply the X.509 bundle for this trust domain only.
+    pub fn new(trust_domain: String, roots: RootCertStore) -> Result<Self, rustls::Error> {
+        if !valid_trust_domain(&trust_domain) {
+            return Err(rustls::Error::General("invalid SPIFFE trust domain".into()));
+        }
+        let chain = WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            super::configuration_provider(),
+        )
+        .build()
+        .map_err(|error| rustls::Error::General(error.to_string()))?;
+        Ok(Self {
+            chain,
+            trust_domain,
+        })
+    }
+
+    /// Read identity evidence from a completed handshake with a verified
+    /// client certificate. The transport already verified key possession.
+    pub fn verify_peer(
+        &self,
+        connection: &ServerConnection,
+        now: UnixTime,
+    ) -> Result<VerifiedSpiffeClient, rustls::Error> {
+        if connection.is_handshaking() {
+            return Err(rustls::Error::General(
+                "SPIFFE client handshake incomplete".into(),
+            ));
+        }
+        let (leaf, intermediates) = connection
+            .peer_certificates()
+            .and_then(<[_]>::split_first)
+            .ok_or(rustls::Error::NoCertificatesPresented)?;
+        self.chain.verify_client_cert(leaf, intermediates, now)?;
+        let (remaining, cert) = x509_parser::certificate::X509Certificate::from_der(leaf.as_ref())
+            .map_err(|_| rustls::Error::General("invalid SPIFFE client certificate".into()))?;
+        let id = single_uri(&cert)?;
+        let expires_at = cert.validity().not_after.timestamp();
+        let key_usage = cert
+            .key_usage()
+            .map_err(|_| rustls::Error::General("invalid SPIFFE client key usage".into()))?;
+        let basic_constraints = cert.basic_constraints().map_err(|_| {
+            rustls::Error::General("invalid SPIFFE client basic constraints".into())
+        })?;
+        if !remaining.is_empty()
+            || basic_constraints.is_some_and(|constraints| constraints.value.ca)
+            || spiffe_path(id).is_none_or(|(domain, _)| domain != self.trust_domain)
+            || !key_usage.is_some_and(|usage| {
+                usage.critical
+                    && usage.value.digital_signature()
+                    && !usage.value.key_cert_sign()
+                    && !usage.value.crl_sign()
+            })
+            || !is_unexpired(expires_at, now)
+        {
+            return Err(rustls::Error::General(
+                "invalid SPIFFE client identity".into(),
+            ));
+        }
+        Ok(VerifiedSpiffeClient {
+            id: id.to_owned(),
+            expires_at,
+        })
+    }
+}
+
+fn is_unexpired(expires_at: i64, now: UnixTime) -> bool {
+    u64::try_from(expires_at).is_ok_and(|expiry| expiry > now.as_secs())
+}
+
+fn single_uri<'a>(
+    cert: &x509_parser::certificate::X509Certificate<'a>,
+) -> Result<&'a str, rustls::Error> {
+    let san = cert
+        .subject_alternative_name()
+        .map_err(|_| rustls::Error::General("invalid SPIFFE certificate SAN".into()))?
+        .ok_or_else(|| rustls::Error::General("missing SPIFFE certificate SAN".into()))?;
+    let mut uris = san
+        .value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            GeneralName::URI(uri) => Some(*uri),
+            _ => None,
+        });
+    match (uris.next(), uris.next()) {
+        (Some(uri), None) => Ok(uri),
+        _ => Err(rustls::Error::General(
+            "SPIFFE certificate must have one URI SAN".into(),
+        )),
+    }
 }
 
 /// Verify the chain and one URI SAN against the configured identity policy.
@@ -96,20 +223,7 @@ impl ServerCertVerifier for SpiffeServerVerifier {
         )?;
         let (_, cert) = x509_parser::certificate::X509Certificate::from_der(leaf.as_ref())
             .map_err(|_| rustls::Error::General("invalid agent certificate".into()))?;
-        let san = cert
-            .subject_alternative_name()
-            .map_err(|_| rustls::Error::General("invalid agent SAN".into()))?
-            .ok_or_else(|| rustls::Error::General("missing agent SAN".into()))?;
-        let uris: Vec<_> = san
-            .value
-            .general_names
-            .iter()
-            .filter_map(|name| match name {
-                GeneralName::URI(uri) => Some(*uri),
-                _ => None,
-            })
-            .collect();
-        if !matches!(uris.as_slice(), [uri] if self.expected.matches(uri)) {
+        if !self.expected.matches(single_uri(&cert)?) {
             return Err(rustls::Error::General(
                 "unexpected agent SPIFFE identity".into(),
             ));
